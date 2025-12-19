@@ -416,7 +416,8 @@ class RAGPipeline:
         prompt: str,
         api_url: str,
         max_tokens: int,
-        extra_request_body: Dict[str, Any]
+        extra_request_body: Dict[str, Any],
+        request_id: Optional[str] = None
     ) -> Dict[str, Any]:
         """
         Send a single request to the completion API.
@@ -426,6 +427,7 @@ class RAGPipeline:
             api_url: API endpoint URL
             max_tokens: Maximum tokens to generate
             extra_request_body: Additional request parameters
+            request_id: Optional request ID for token tracking
         
         Returns:
             Dictionary with response data including:
@@ -446,6 +448,10 @@ class RAGPipeline:
                 "ignore_eos": False,
                 **extra_request_body,
             }
+            
+            # Add request_id for token tracking (used by RAGBoost proxy)
+            if request_id:
+                payload["request_id"] = request_id
             
             output = {
                 "generated_text": "",
@@ -511,7 +517,8 @@ class RAGPipeline:
         api_url: str,
         max_tokens: int,
         batch_size: Optional[int] = None,
-        extra_request_body: Optional[Dict[str, Any]] = None
+        extra_request_body: Optional[Dict[str, Any]] = None,
+        request_ids: Optional[List[str]] = None
     ) -> tuple[List[Dict[str, Any]], float]:
         """
         Send all prompts to the API and collect results.
@@ -523,6 +530,7 @@ class RAGPipeline:
             batch_size: Number of requests per batch. If None, send all at once.
                        When set, will send next batch after 50% of current batch completes.
             extra_request_body: Additional parameters for the API request
+            request_ids: Optional list of request IDs for token tracking (one per prompt)
         
         Returns:
             Tuple of (results, total_time) where total_time is end-to-end latency in seconds
@@ -534,13 +542,15 @@ class RAGPipeline:
         if batch_size is None or batch_size >= len(prompts):
             tasks = []
             
-            for prompt in prompts:
+            for i, prompt in enumerate(prompts):
+                req_id = request_ids[i] if request_ids and i < len(request_ids) else None
                 tasks.append(
                     self._async_request_completions(
                         prompt=prompt,
                         api_url=api_url,
                         max_tokens=max_tokens,
-                        extra_request_body=extra_request_body
+                        extra_request_body=extra_request_body,
+                        request_id=req_id
                     )
                 )
             
@@ -565,12 +575,14 @@ class RAGPipeline:
                 
                 for idx in range(batch_start_idx, batch_end_idx):
                     prompt = prompts[idx]
+                    req_id = request_ids[idx] if request_ids and idx < len(request_ids) else None
                     task = asyncio.create_task(
                         self._async_request_completions(
                             prompt=prompt,
                             api_url=api_url,
                             max_tokens=max_tokens,
-                            extra_request_body=extra_request_body
+                            extra_request_body=extra_request_body,
+                            request_id=req_id
                         )
                     )
                     active_tasks[task] = idx
@@ -653,6 +665,11 @@ class RAGPipeline:
                 for chunk_id, doc in self.corpus_map.items()
             }
             
+            # Determine if we should apply chat template
+            apply_template = self.inference_config.apply_chat_template if self.inference_config else False
+            model_name = self.inference_config.model_name if self.inference_config else None
+            system_prompt = self.inference_config.system_prompt if self.inference_config else None
+            
             # Generate prompts for all groups using prompt_generator
             prompts = []
             all_qids = []
@@ -661,7 +678,10 @@ class RAGPipeline:
             for group in optimized_results["groups"]:
                 group_prompts, group_qids, group_answers = prompt_generator(
                     chunk_id_text_dict, 
-                    group["items"]
+                    group["items"],
+                    model_name=model_name,
+                    system_prompt=system_prompt,
+                    apply_template=apply_template
                 )
                 prompts.extend(group_prompts)
                 all_qids.extend(group_qids)
@@ -669,6 +689,58 @@ class RAGPipeline:
         
         if not prompts:
             raise ValueError("No prompts found in optimized_results")
+        
+        # Initialize request_ids (will be populated from build response)
+        request_ids = None
+        
+        # BUILD INDEX FIRST - extract contexts from optimized results
+        try:
+            contexts = []
+            for group in optimized_results["groups"]:
+                for item in group["items"]:
+                    # Each item has a context (list of doc IDs)
+                    # The key is "top_k_doc_id" from the optimize method
+                    if "top_k_doc_id" in item:
+                        contexts.append(item["top_k_doc_id"])
+                    elif "context" in item:
+                        contexts.append(item["context"])
+                    elif "deduplicated_docs" in item:
+                        contexts.append(item["deduplicated_docs"])
+                    elif "retrieved_docs" in item:
+                        contexts.append(item["retrieved_docs"])
+            
+            if contexts:
+                build_url = f"{self.inference_config.base_url}/build"
+                self._log(f"📦 Building index with {len(contexts)} contexts at {build_url}")
+                
+                import requests
+                build_response = requests.post(
+                    build_url,
+                    json={
+                        "contexts": contexts,
+                        "initial_tokens_per_context": 100,
+                        "alpha": 0.005,
+                        "use_gpu": False,
+                        "linkage_method": "average"
+                    },
+                    timeout=60
+                )
+                
+                if build_response.status_code == 200:
+                    build_result = build_response.json()
+                    # Use the ordered request_ids list that matches input contexts order
+                    request_ids = build_result.get("request_ids", [])
+                    if not request_ids:
+                        # Fallback to dict keys if ordered list not available
+                        request_id_mapping = build_result.get("request_id_mapping", {})
+                        request_ids = list(request_id_mapping.keys())
+                    self._log(f"✅ Index built successfully with {len(request_ids)} request IDs")
+                else:
+                    self._log(f"⚠️  Index build failed: {build_response.status_code} - {build_response.text}")
+                    request_ids = None
+        except Exception as e:
+            self._log(f"⚠️  Failed to build index (continuing anyway): {e}")
+            request_ids = None
         
         # Set parameters
         max_tokens = max_tokens or self.inference_config.max_tokens
@@ -680,14 +752,15 @@ class RAGPipeline:
         # Construct API URL
         api_url = f"{self.inference_config.base_url}/v1/completions"
         
-        # Run inference
+        # Run inference with request_ids for token tracking
         results, total_time = asyncio.run(
             self._benchmark_inference(
                 prompts=prompts,
                 api_url=api_url,
                 max_tokens=max_tokens,
                 batch_size=batch_size,
-                extra_request_body=inference_kwargs
+                extra_request_body=inference_kwargs,
+                request_ids=request_ids
             )
         )
         
