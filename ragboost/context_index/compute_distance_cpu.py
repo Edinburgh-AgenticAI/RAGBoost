@@ -9,6 +9,108 @@ from multiprocessing import Pool, cpu_count
 from typing import List
 
 
+def compute_distance_single(context_a: List[int], context_b: List[int], alpha: float = 0.005) -> float:
+    """
+    Compute distance between two contexts using our metric:
+    distance = (1 - overlap/max_size) + alpha * avg_position_diff
+    
+    Args:
+        context_a: First context (list of doc IDs)
+        context_b: Second context (list of doc IDs)
+        alpha: Weight for position difference term
+        
+    Returns:
+        Distance value (lower = more similar)
+    """
+    if not context_a or not context_b:
+        return 1.0
+    
+    # Build position maps
+    pos_a = {doc: pos for pos, doc in enumerate(context_a)}
+    pos_b = {doc: pos for pos, doc in enumerate(context_b)}
+    
+    # Find intersection
+    intersection = set(pos_a.keys()) & set(pos_b.keys())
+    intersection_size = len(intersection)
+    
+    if intersection_size == 0:
+        return 1.0
+    
+    # Overlap term: 1 - |intersection| / max(|A|, |B|)
+    max_size = max(len(context_a), len(context_b))
+    overlap_term = 1.0 - (intersection_size / max_size)
+    
+    # Position term: alpha * avg(|pos_A - pos_B|)
+    position_diff_sum = sum(abs(pos_a[doc] - pos_b[doc]) for doc in intersection)
+    position_term = alpha * (position_diff_sum / intersection_size)
+    
+    return overlap_term + position_term
+
+
+def compute_distances_batch(queries: List[List[int]], 
+                           targets: List[List[int]], 
+                           alpha: float = 0.005,
+                           num_workers: int = None) -> np.ndarray:
+    """
+    Compute distances from multiple query contexts to multiple target contexts.
+    Returns a (num_queries x num_targets) distance matrix.
+    
+    This is optimized for the search use case where we have:
+    - queries: new contexts to search for
+    - targets: existing node doc_ids in the tree
+    
+    Args:
+        queries: List of query contexts
+        targets: List of target contexts (e.g., node doc_ids)
+        alpha: Weight for position difference term
+        num_workers: Number of parallel workers (default: all CPU cores)
+        
+    Returns:
+        Distance matrix of shape (len(queries), len(targets))
+    """
+    if num_workers is None:
+        num_workers = min(cpu_count(), 8)  # Cap at 8 for this use case
+    
+    n_queries = len(queries)
+    n_targets = len(targets)
+    
+    if n_queries == 0 or n_targets == 0:
+        return np.zeros((n_queries, n_targets), dtype=np.float32)
+    
+    # For small inputs, just compute directly (avoid multiprocessing overhead)
+    if n_queries * n_targets < 1000:
+        distances = np.ones((n_queries, n_targets), dtype=np.float32)
+        for i, query in enumerate(queries):
+            for j, target in enumerate(targets):
+                distances[i, j] = compute_distance_single(query, target, alpha)
+        return distances
+    
+    # Prepare all pairs to compute
+    pairs = [(i, j) for i in range(n_queries) for j in range(n_targets)]
+    
+    # Split into batches
+    batch_size = max(100, len(pairs) // (num_workers * 4))
+    batches = [pairs[i:i+batch_size] for i in range(0, len(pairs), batch_size)]
+    
+    # Worker function
+    def worker(batch):
+        results = []
+        for i, j in batch:
+            dist = compute_distance_single(queries[i], targets[j], alpha)
+            results.append((i, j, dist))
+        return results
+    
+    # Compute in parallel
+    distances = np.ones((n_queries, n_targets), dtype=np.float32)
+    
+    with Pool(num_workers) as pool:
+        for batch_results in pool.imap_unordered(worker, batches):
+            for i, j, dist in batch_results:
+                distances[i, j] = dist
+    
+    return distances
+
+
 def prepare_contexts_for_cpu(contexts):
     """Prepare contexts using same strategy as GPU - sorting and flattening."""
     n = len(contexts)

@@ -153,6 +153,9 @@ class RAGPipeline:
         # Multi-turn conversation manager
         self.multi_turn_manager = MultiTurnManager()
         
+        # Track if index has been built (for incremental builds)
+        self._index_built = False
+        
         # Verbose flag
         self.verbose = kwargs.get("verbose", True)
         
@@ -449,9 +452,10 @@ class RAGPipeline:
                 **extra_request_body,
             }
             
-            # Add request_id for token tracking (used by RAGBoost proxy)
+            # Add rid for request tracking in SGLang's radix cache
+            # SGLang uses 'rid' field to identify requests
             if request_id:
-                payload["request_id"] = request_id
+                payload["rid"] = request_id
             
             output = {
                 "generated_text": "",
@@ -495,7 +499,7 @@ class RAGPipeline:
                                     output_len = (data.get("usage") or {}).get(
                                         "completion_tokens", output_len
                                     )
-                        
+
                         output["generated_text"] = generated_text
                         output["success"] = True
                         output["latency"] = latency
@@ -511,7 +515,7 @@ class RAGPipeline:
             
             return output
     
-    async def _benchmark_inference(
+    async def _inference(
         self,
         prompts: List[str],
         api_url: str,
@@ -711,7 +715,10 @@ class RAGPipeline:
             
             if contexts:
                 build_url = f"{self.inference_config.base_url}/build"
-                self._log(f"📦 Building index with {len(contexts)} contexts at {build_url}")
+                # Use incremental mode if index might already exist
+                incremental = getattr(self, '_index_built', False)
+                mode_str = "incremental" if incremental else "initial"
+                self._log(f"📦 Building index ({mode_str}) with {len(contexts)} contexts at {build_url}")
                 
                 import requests
                 build_response = requests.post(
@@ -721,7 +728,8 @@ class RAGPipeline:
                         "initial_tokens_per_context": 100,
                         "alpha": 0.005,
                         "use_gpu": False,
-                        "linkage_method": "average"
+                        "linkage_method": "average",
+                        "incremental": incremental
                     },
                     timeout=60
                 )
@@ -734,7 +742,14 @@ class RAGPipeline:
                         # Fallback to dict keys if ordered list not available
                         request_id_mapping = build_result.get("request_id_mapping", {})
                         request_ids = list(request_id_mapping.keys())
-                    self._log(f"✅ Index built successfully with {len(request_ids)} request IDs")
+                    
+                    # Log match stats for incremental builds
+                    matched = build_result.get("matched_count", 0)
+                    inserted = build_result.get("inserted_count", len(request_ids))
+                    self._log(f"✅ Index built: {len(request_ids)} request IDs (matched={matched}, inserted={inserted})")
+                    
+                    # Mark index as built for subsequent calls
+                    self._index_built = True
                 else:
                     self._log(f"⚠️  Index build failed: {build_response.status_code} - {build_response.text}")
                     request_ids = None
@@ -754,7 +769,7 @@ class RAGPipeline:
         
         # Run inference with request_ids for token tracking
         results, total_time = asyncio.run(
-            self._benchmark_inference(
+            self._inference(
                 prompts=prompts,
                 api_url=api_url,
                 max_tokens=max_tokens,

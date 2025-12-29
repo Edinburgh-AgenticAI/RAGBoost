@@ -117,7 +117,10 @@ class ContextIndex:
         n = len(contexts)
         
         if n < 2:
-            print("Need at least two contexts for clustering.")
+            if n == 0:
+                print("No contexts provided, returning empty index.")
+            else:
+                print(f"Only {n} context(s) provided, skipping clustering.")
             return self._handle_single_prompt(contexts)
         
         # Compute distance matrix
@@ -198,13 +201,19 @@ class ContextIndex:
         # Update search paths even for single nodes
         self.node_manager.update_search_paths()
         
+        # For single context, extract search paths (will be empty for root-only tree)
+        search_paths = self.context_orderer.extract_search_paths(
+            self.node_manager.unique_nodes, len(contexts)
+        )
+        
         return IndexResult(
             linkage_matrix=np.empty((0, 4)),
             cluster_nodes=self.node_manager.cluster_nodes,
             unique_nodes=self.node_manager.unique_nodes,
             reordered_contexts=contexts.copy() if hasattr(contexts, 'copy') else list(contexts),
             original_contexts=contexts,
-            stats=self.node_manager.get_node_stats()
+            stats=self.node_manager.get_node_stats(),
+            search_paths=search_paths
         )
     
     def _build_tree(self, contexts: List[List[int]], linkage_matrix: np.ndarray):

@@ -149,6 +149,110 @@ class RAGBoostIndexClient:
         })
     
     # =========================================================================
+    # Index Building (Stateful Mode)
+    # =========================================================================
+    
+    def build(
+        self,
+        contexts: List[List[int]],
+        alpha: float = 0.005,
+        use_gpu: bool = False,
+        linkage_method: str = "average",
+        initial_tokens_per_context: int = 0,
+        incremental: bool = False,
+        deduplicate: bool = False,
+        parent_request_ids: Optional[List[Optional[str]]] = None,
+        hint_template: Optional[str] = None
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Build a new index or incrementally update an existing one.
+        
+        This is the main method for creating the live index.
+        
+        Args:
+            contexts: List of contexts (each is a list of document IDs)
+            alpha: Distance computation parameter (default 0.005)
+            use_gpu: Use GPU for distance computation (default False)
+            linkage_method: Clustering method (default "average")
+            initial_tokens_per_context: Initial token count per context
+            incremental: Use incremental build (search/reorder/merge)
+            deduplicate: Enable multi-turn deduplication
+            parent_request_ids: Parent request IDs for deduplication
+            hint_template: Custom template for reference hints
+            
+        Returns:
+            Dictionary with request_ids, stats, and optional deduplication results
+        """
+        payload = {
+            "contexts": contexts,
+            "alpha": alpha,
+            "use_gpu": use_gpu,
+            "linkage_method": linkage_method,
+            "initial_tokens_per_context": initial_tokens_per_context,
+            "incremental": incremental,
+            "deduplicate": deduplicate,
+        }
+        
+        if parent_request_ids is not None:
+            payload["parent_request_ids"] = parent_request_ids
+        if hint_template is not None:
+            payload["hint_template"] = hint_template
+            
+        return self._post("/build", payload)
+    
+    # =========================================================================
+    # Multi-Turn Deduplication
+    # =========================================================================
+    
+    def deduplicate(
+        self,
+        contexts: List[List[int]],
+        parent_request_ids: List[Optional[str]],
+        hint_template: Optional[str] = None
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Deduplicate contexts for multi-turn conversations.
+        
+        This is a lightweight endpoint for Turn 2+ in conversations.
+        It only performs deduplication - no index build or search operations.
+        
+        Recommended flow:
+        1. Turn 1: Call build() with deduplicate=True
+        2. Turn 2+: Call deduplicate() (10-100x faster than build)
+        
+        Args:
+            contexts: List of contexts to deduplicate
+            parent_request_ids: Parent request IDs (None = new conversation)
+            hint_template: Custom template for reference hints
+            
+        Returns:
+            Dictionary with:
+            - request_ids: New request IDs for this turn
+            - results: List of deduplication results per context
+            - summary: Statistics about deduplication
+        """
+        payload = {
+            "contexts": contexts,
+            "parent_request_ids": parent_request_ids,
+        }
+        
+        if hint_template is not None:
+            payload["hint_template"] = hint_template
+            
+        return self._post("/deduplicate", payload)
+    
+    def reset(self) -> Optional[Dict[str, Any]]:
+        """
+        Reset the index and conversation tracker.
+        
+        Call this to clear all state and start fresh.
+        
+        Returns:
+            Dictionary with reset confirmation
+        """
+        return self._post("/reset", {})
+    
+    # =========================================================================
     # Token Tracking (SGLang Integration)
     # =========================================================================
     
@@ -199,6 +303,48 @@ class RAGBoostIndexClient:
         """Check if the server is ready."""
         health = self.health()
         return health is not None and health.get("status") == "ready"
+    
+    # =========================================================================
+    # Stateless Mode (Batch Scheduling Only)
+    # =========================================================================
+    
+    def schedule(
+        self,
+        contexts: List[List[int]],
+        alpha: float = 0.005,
+        use_gpu: bool = False,
+        linkage_method: str = "average"
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Schedule a batch of contexts (STATELESS MODE).
+        
+        This performs clustering and scheduling WITHOUT tracking cache state.
+        Use this when you want to:
+        1. Just reorder contexts for optimal prefix sharing
+        2. Process batches independently without maintaining server state
+        3. Send scheduled contexts directly to LLM engine without cache sync
+        
+        No cache tracking, eviction, or token updates required.
+        Each call is independent - perfect for batch processing.
+        
+        Args:
+            contexts: List of contexts (each is a list of document IDs)
+            alpha: Distance computation parameter (default 0.005)
+            use_gpu: Use GPU for distance computation (default False)
+            linkage_method: Linkage method for clustering (default "average")
+        
+        Returns:
+            Dictionary with:
+            - scheduled_contexts: Reordered contexts for optimal prefix sharing
+            - original_indices: Mapping to original context indices
+            - groups: Execution groups with prefix sharing info
+        """
+        return self._post("/schedule", {
+            "contexts": contexts,
+            "alpha": alpha,
+            "use_gpu": use_gpu,
+            "linkage_method": linkage_method
+        })
     
     def close(self):
         """Close the client session."""
@@ -259,4 +405,47 @@ def update_request_tokens(
         return response.json()
     except Exception as e:
         logger.warning(f"RAGBoost token update failed: {e}")
+        return None
+
+
+def schedule_batch(
+    contexts: List[List[int]],
+    server_url: str = "http://localhost:8765",
+    alpha: float = 0.005,
+    use_gpu: bool = False,
+    linkage_method: str = "average",
+    timeout: float = 30.0
+):
+    """
+    Schedule a batch of contexts for optimal prefix sharing (STATELESS MODE).
+    
+    For one-off calls without maintaining a client instance.
+    Perfect for batch processing without needing to track cache state.
+    
+    Args:
+        contexts: List of contexts (each is a list of document IDs)
+        server_url: RAGBoost server URL
+        alpha: Distance computation parameter
+        use_gpu: Use GPU for distance computation
+        linkage_method: Linkage method for clustering
+        timeout: Request timeout (longer for large batches)
+    
+    Returns:
+        Dictionary with scheduled_contexts, original_indices, groups
+    """
+    try:
+        response = requests.post(
+            f"{server_url}/schedule",
+            json={
+                "contexts": contexts,
+                "alpha": alpha,
+                "use_gpu": use_gpu,
+                "linkage_method": linkage_method
+            },
+            timeout=timeout
+        )
+        response.raise_for_status()
+        return response.json()
+    except Exception as e:
+        logger.warning(f"RAGBoost batch scheduling failed: {e}")
         return None

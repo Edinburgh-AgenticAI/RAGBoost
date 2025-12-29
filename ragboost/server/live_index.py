@@ -1,7 +1,7 @@
 """
 Live Context Index
 
-Dynamic context index supporting search, insertion, updates, and eviction.
+Dynamic context index supporting search, insertion, and eviction notification.
 Implements the algorithms described in the RAGBoost paper.
 
 Inherits from ContextIndex to provide:
@@ -13,20 +13,27 @@ Inherits from ContextIndex to provide:
 Key Design for Request Tracking:
 - request_id is ONLY stored on leaf nodes (actual requests)
 - Parent/intermediate nodes do NOT have request_id values
-- Eviction removes entire request when all tokens are evicted
+- Eviction is driven by SGLang's radix cache callback (not internal heap)
 - Tree is automatically pruned when branches become empty
+
+IMPORTANT: Eviction is now handled via callback from SGLang's radix cache.
+When SGLang evicts a request from its cache, it calls our callback with
+the evicted request_ids. No need to maintain a separate eviction heap.
 """
 
 import time
 import uuid
+import logging
 from typing import List, Dict, Tuple, Optional, Any, Set
 from collections import deque
 
 from ..context_index.index_construction import ContextIndex
 from ..context_index.tree_nodes import ClusterNode
+from ..context_index.compute_distance_cpu import compute_distance_single, compute_distances_batch
 from ..context_ordering import InterContextScheduler
 from .metadata import NodeMetadata
-from .eviction_heap import EvictionHeap
+
+logger = logging.getLogger(__name__)
 
 
 def compute_prefix_length(list1: List[int], list2: List[int]) -> int:
@@ -46,28 +53,25 @@ class LiveContextIndex(ContextIndex):
     
     Workflow:
     1. Build initial index: build_and_schedule() -> constructs tree, reorders, schedules
-    2. Go live: enable dynamic search, insert, update, evict operations
+    2. Go live: enable dynamic search, insert operations
     3. Track requests: each leaf node has a unique request_id
-    4. Accumulate tokens: update input+output tokens when requests complete
-    5. Evict on capacity: when heap exceeds max_tokens, evict LRU requests
+    4. Eviction: handled via callback from SGLang's radix cache
     
     Key invariants:
     - Only leaf nodes have request_id values
     - Parent/intermediate nodes do NOT have request_id
-    - Eviction heap and context index remain synchronized
     - Tree is automatically pruned when branches become empty
+    - Eviction is DRIVEN BY SGLANG (not internal heap)
     
     Supports:
     - Context search: O(|C| · log n)
     - Node traversal: O(h)
     - Context insertion: O(1) or O(|C|)
-    - Token updates: O(1)
-    - Eviction: O(k · h) for k nodes
+    - Request removal: O(h) for pruning
     """
     
     def __init__(self, alpha: float = 0.005, use_gpu: bool = False,
-                 linkage_method: str = "average", batch_size: int = 10000,
-                 max_tokens: Optional[int] = None):
+                 linkage_method: str = "average", batch_size: int = 10000):
         """
         Initialize live context index.
         
@@ -76,7 +80,6 @@ class LiveContextIndex(ContextIndex):
             use_gpu: Whether to use GPU for distance computation
             linkage_method: Linkage method for hierarchical clustering
             batch_size: Batch size for distance computation
-            max_tokens: Maximum token capacity (triggers eviction when exceeded)
         """
         # Initialize parent ContextIndex
         super().__init__(alpha=alpha, use_gpu=use_gpu,
@@ -84,12 +87,10 @@ class LiveContextIndex(ContextIndex):
         
         # Additional components for live operations
         self.metadata: Dict[int, NodeMetadata] = {}
-        self.eviction_heap = EvictionHeap(max_tokens=max_tokens)
         self.inter_scheduler = InterContextScheduler()
         
         # Request tracking
         self._request_to_node: Dict[str, int] = {}  # request_id -> node_id
-        self._max_tokens = max_tokens
         self._next_request_counter: int = 0  # Counter for auto-generating request_ids
         
         # Track if index is live
@@ -106,24 +107,40 @@ class LiveContextIndex(ContextIndex):
         self.live_stats = {
             'total_searches': 0,
             'total_insertions': 0,
-            'total_updates': 0,
             'total_evictions': 0,
-            'total_token_updates': 0,
             'total_search_time_us': 0,
             'total_traversal_time_us': 0,
         }
     
-    @property
-    def max_tokens(self) -> Optional[int]:
-        """Get maximum token capacity."""
-        return self._max_tokens
+    def get_all_request_ids(self) -> Set[str]:
+        """Get all tracked request IDs."""
+        return set(self._request_to_node.keys())
     
-    @max_tokens.setter
-    def max_tokens(self, value: int):
-        """Set maximum token capacity."""
-        self._max_tokens = value
-        self.eviction_heap.max_tokens = value
-    
+    def reset(self):
+        """
+        Reset the index to initial state.
+        
+        Clears all nodes, metadata, and request tracking.
+        Use this to start fresh without creating a new instance.
+        """
+        self.metadata.clear()
+        self._request_to_node.clear()
+        self._next_request_counter = 0
+        self.is_live = False
+        self.initial_result = None
+        self.scheduled_result = None
+        self.nodes.clear()
+        self.root_id = None
+        self.next_node_id = 0
+        self.live_stats = {
+            'total_searches': 0,
+            'total_insertions': 0,
+            'total_evictions': 0,
+            'total_search_time_us': 0,
+            'total_traversal_time_us': 0,
+        }
+        logger.info("Index reset to initial state")
+
     def build_and_schedule(self, contexts: List[List[int]], 
                           initial_tokens_per_context: int = 0) -> Dict:
         """
@@ -169,10 +186,12 @@ class LiveContextIndex(ContextIndex):
         
         # Step 3: Initialize live metadata (auto-generates request_ids)
         print("\n3. Initializing live metadata...")
-        request_id_mapping, request_ids_ordered = self._initialize_live_metadata(initial_tokens_per_context)
+        request_id_mapping, request_ids_ordered = self._initialize_live_metadata(
+            initial_tokens_per_context, 
+            num_input_contexts=len(contexts)
+        )
         
         print(f"   ✓ Initialized {len(self.metadata)} nodes with metadata")
-        print(f"   ✓ Eviction heap size: {len(self.eviction_heap)}")
         print(f"   ✓ Auto-assigned {len(request_id_mapping)} request IDs")
         
         # Add request_id mapping to result (dict and ordered list)
@@ -188,7 +207,460 @@ class LiveContextIndex(ContextIndex):
         
         return self.scheduled_result
     
-    def _initialize_live_metadata(self, initial_tokens_per_context: int) -> Tuple[Dict[str, int], List[str]]:
+    def build_incremental(self, contexts: List[List[int]], 
+                          initial_tokens_per_context: int = 0) -> Dict:
+        """
+        Incrementally build/update index for a new batch of contexts.
+        
+        Algorithm:
+        1. For each context, search existing index to find best matching node
+        2. If match found (shared_prefix > 0): reorder context to align with matched path
+        3. For contexts with no match: build a separate temporary index
+        4. Merge: children of new temp index become children of global root
+        5. Assign new request_ids to all new contexts
+        
+        Args:
+            contexts: List of contexts (each is a list of document IDs)
+            initial_tokens_per_context: Initial token count for new contexts
+            
+        Returns:
+            Dictionary with:
+                - request_ids: List of NEW request_ids in same order as input contexts
+                - reordered_contexts: Contexts reordered for optimal cache reuse
+                - scheduled_order: Optimized execution order
+                - groups: Execution groups for cache efficiency
+        """
+        if not self.is_live:
+            # First batch - do full build
+            print("Index not live, performing full build...")
+            result = self.build_and_schedule(contexts, initial_tokens_per_context)
+            return {
+                'request_ids': result.get('request_ids', []),
+                'reordered_contexts': result.get('scheduled_reordered', contexts),
+                'matched_count': 0,
+                'inserted_count': len(contexts),
+                'merged_count': 0,
+                'scheduled_order': result.get('final_mapping', list(range(len(contexts)))),
+                'groups': result.get('groups', []),
+            }
+        
+        print("=" * 80)
+        print("INCREMENTAL BUILD - Search, Reorder, Build, Merge")
+        print("=" * 80)
+        
+        matched_contexts = []  # (original_idx, reordered_context, search_path)
+        unmatched_contexts = []  # (original_idx, context)
+        
+        print(f"\n1. Batch searching existing index for {len(contexts)} contexts...")
+        
+        # Use batch search for efficiency
+        search_results = self.search_batch(contexts)
+        
+        for i, (context, (search_path, matched_node_id, overlap_count)) in enumerate(zip(contexts, search_results)):
+            if overlap_count > 0 and matched_node_id >= 0:
+                # Has a match - reorder context to start with matched node's prefix
+                matched_node = self.nodes.get(matched_node_id)
+                node_docs = None
+                if matched_node_id in self.metadata and self.metadata[matched_node_id].doc_ids:
+                    node_docs = self.metadata[matched_node_id].doc_ids
+                elif matched_node and hasattr(matched_node, 'doc_ids') and matched_node.doc_ids:
+                    node_docs = matched_node.doc_ids
+                
+                if node_docs:
+                    reordered = self._reorder_with_prefix(context, node_docs)
+                    print(f"   Context {i}: matched node {matched_node_id} with overlap={overlap_count}")
+                    print(f"      Original:  {context[:8]}{'...' if len(context) > 8 else ''}")
+                    print(f"      Reordered: {reordered[:8]}{'...' if len(reordered) > 8 else ''}")
+                else:
+                    reordered = context
+                matched_contexts.append((i, reordered, search_path))
+            else:
+                # No match - will build new index for these
+                unmatched_contexts.append((i, context))
+        
+        print(f"   ✓ Found {len(matched_contexts)} contexts with matches")
+        print(f"   ✓ Found {len(unmatched_contexts)} contexts without matches")
+        
+        # Prepare result arrays (will fill in order)
+        request_ids = [None] * len(contexts)
+        reordered_contexts = [None] * len(contexts)
+        context_info = []  # For scheduling: (original_idx, request_id, search_path)
+        
+        # Step 2: Insert matched contexts into existing tree
+        print(f"\n2. Inserting {len(matched_contexts)} matched contexts...")
+        for orig_idx, reordered, search_path in matched_contexts:
+            new_node_id, new_search_path, request_id = self.insert(
+                reordered, search_path, initial_tokens_per_context
+            )
+            request_ids[orig_idx] = request_id
+            reordered_contexts[orig_idx] = reordered
+            context_info.append((orig_idx, request_id, new_search_path))
+        
+        # Step 3: Build temporary index for unmatched contexts and merge
+        merged_count = 0
+        if unmatched_contexts:
+            print(f"\n3. Building temporary index for {len(unmatched_contexts)} unmatched contexts...")
+            
+            # Extract just the contexts for building
+            unmatched_only = [ctx for _, ctx in unmatched_contexts]
+            
+            # Build a temporary index (don't go live)
+            temp_index = LiveContextIndex(
+                alpha=self.alpha,
+                use_gpu=self.use_gpu,
+                linkage_method=self.linkage_method,
+                batch_size=self.batch_size
+            )
+            temp_result = temp_index.fit_transform(unmatched_only)
+            
+            print(f"   ✓ Built temp index with {temp_result.stats['total_nodes']} nodes")
+            
+            # Step 4: Merge temp index into global index
+            print("\n4. Merging temp index into global index...")
+            merged_request_ids, merged_search_paths = self._merge_index(
+                temp_index=temp_result,
+                unmatched_info=unmatched_contexts,
+                initial_tokens=initial_tokens_per_context
+            )
+            
+            # Fill in request_ids and reordered_contexts for unmatched
+            for i, (orig_idx, orig_context) in enumerate(unmatched_contexts):
+                request_ids[orig_idx] = merged_request_ids[i]
+                # Use reordered context from temp index
+                if i < len(temp_result.reordered_contexts):
+                    reordered_contexts[orig_idx] = temp_result.reordered_contexts[i]
+                else:
+                    reordered_contexts[orig_idx] = orig_context
+                context_info.append((orig_idx, merged_request_ids[i], merged_search_paths[i]))
+            
+            merged_count = len(unmatched_contexts)
+            print(f"   ✓ Merged {merged_count} new subtrees under global root")
+        
+        # Step 5: Schedule execution order
+        print("\n5. Scheduling execution order for cache reuse...")
+        scheduled_order = self._schedule_incremental(context_info)
+        groups = self._group_by_path_prefix(context_info)
+        print(f"   ✓ Scheduled {len(scheduled_order)} contexts into {len(groups)} groups")
+        
+        print("\n" + "=" * 80)
+        print(f"✓ INCREMENTAL BUILD COMPLETE")
+        print(f"   Matched & inserted: {len(matched_contexts)}")
+        print(f"   Built & merged: {merged_count}")
+        print("=" * 80 + "\n")
+        
+        return {
+            'request_ids': request_ids,
+            'reordered_contexts': reordered_contexts,
+            'matched_count': len(matched_contexts),
+            'inserted_count': len(contexts),
+            'merged_count': merged_count,
+            'scheduled_order': scheduled_order,
+            'groups': groups,
+        }
+    
+    def _reorder_with_prefix(self, context: List[int], prefix: List[int]) -> List[int]:
+        """
+        Reorder context to start with the matched prefix.
+        
+        Example: context=[a,b,c], prefix=[c,a] -> result=[c,a,b]
+        
+        Args:
+            context: Original context
+            prefix: Prefix to match (from matched node)
+            
+        Returns:
+            Reordered context starting with matched prefix elements
+        """
+        context_set = set(context)
+        result = []
+        
+        # First, add elements from prefix that exist in context
+        prefix_used = set()
+        for elem in prefix:
+            if elem in context_set and elem not in prefix_used:
+                result.append(elem)
+                prefix_used.add(elem)
+        
+        # Then, add remaining elements from context
+        for elem in context:
+            if elem not in prefix_used:
+                result.append(elem)
+        
+        return result
+    
+    def _merge_index(self, temp_index, unmatched_info: List[Tuple], 
+                     initial_tokens: int) -> Tuple[List[str], List[List[int]]]:
+        """
+        Merge a temporary index into the global index.
+        
+        The children of temp_index's root become children of global root.
+        
+        Args:
+            temp_index: IndexResult from fit_transform on unmatched contexts
+            unmatched_info: List of (original_idx, context) for unmatched contexts
+            initial_tokens: Initial token count for new nodes
+            
+        Returns:
+            Tuple of (request_ids, search_paths) for merged contexts
+        """
+        request_ids = []
+        search_paths = []
+        
+        # Find temp root
+        temp_root = None
+        for node_id, node in temp_index.unique_nodes.items():
+            if node.is_root:
+                temp_root = node
+                break
+        
+        if temp_root is None:
+            # No tree built, insert contexts directly
+            for orig_idx, context in unmatched_info:
+                new_node_id, new_path, req_id = self.insert(context, [], initial_tokens)
+                request_ids.append(req_id)
+                search_paths.append(new_path)
+            return request_ids, search_paths
+        
+        # Get global root
+        global_root = self.nodes.get(self.root_id)
+        if global_root is None:
+            # No global root, insert directly
+            for orig_idx, context in unmatched_info:
+                new_node_id, new_path, req_id = self.insert(context, [], initial_tokens)
+                request_ids.append(req_id)
+                search_paths.append(new_path)
+            return request_ids, search_paths
+        
+        # Map from temp node_id to new node_id in global index
+        node_id_map = {}
+        
+        # Children of temp root become children of global root
+        # We need to copy the entire subtree under each child
+        base_child_idx = len(global_root.children)
+        
+        for child_idx, temp_child_id in enumerate(temp_root.children):
+            new_child_idx = base_child_idx + child_idx
+            self._copy_subtree(
+                temp_index.unique_nodes,
+                temp_child_id,
+                self.root_id,
+                node_id_map,
+                initial_tokens,
+                [new_child_idx]  # Base search path for this subtree
+            )
+        
+        # Now map original contexts to their request_ids
+        for i, (orig_idx, context) in enumerate(unmatched_info):
+            # Find which leaf node this context belongs to
+            temp_leaf_id = None
+            for node_id, node in temp_index.unique_nodes.items():
+                if node.is_leaf and i in node.original_indices:
+                    temp_leaf_id = node_id
+                    break
+            
+            if temp_leaf_id is not None and temp_leaf_id in node_id_map:
+                new_node_id = node_id_map[temp_leaf_id]
+                if new_node_id in self.metadata:
+                    req_id = self.metadata[new_node_id].request_id
+                    search_path = self.metadata[new_node_id].search_path
+                    request_ids.append(req_id)
+                    search_paths.append(search_path)
+                    continue
+            
+            # Fallback: insert directly
+            new_node_id, new_path, req_id = self.insert(context, [], initial_tokens)
+            request_ids.append(req_id)
+            search_paths.append(new_path)
+        
+        return request_ids, search_paths
+    
+    def _copy_subtree(self, source_nodes: Dict, source_node_id: int, 
+                      parent_id: int, node_id_map: Dict, 
+                      initial_tokens: int, search_path: List[int]):
+        """
+        Copy a subtree from source index into the global index.
+        
+        Args:
+            source_nodes: Source index's unique_nodes
+            source_node_id: Root of subtree to copy
+            parent_id: Parent in global index
+            node_id_map: Mapping from source node_id to new node_id
+            initial_tokens: Initial token count for leaf nodes
+            search_path: Search path to this node in global index
+        """
+        source_node = source_nodes.get(source_node_id)
+        if source_node is None:
+            return
+        
+        # Create new node in global index
+        new_node_id = self.next_node_id
+        self.next_node_id += 1
+        
+        # Copy node
+        new_node = ClusterNode(
+            node_id=new_node_id,
+            content=source_node.doc_ids if hasattr(source_node, 'doc_ids') else [],
+            children=[],
+            parent=parent_id,
+            original_indices=set(source_node.original_indices) if hasattr(source_node, 'original_indices') else set()
+        )
+        
+        self.nodes[new_node_id] = new_node
+        node_id_map[source_node_id] = new_node_id
+        
+        # Add to parent's children
+        parent_node = self.nodes.get(parent_id)
+        if parent_node:
+            parent_node.add_child(new_node_id)
+        
+        # Create metadata
+        is_leaf = source_node.is_leaf
+        request_id = f"req-{uuid.uuid4().hex[:12]}" if is_leaf else None
+        
+        parent_tokens = self.metadata[parent_id].total_tokens if parent_id in self.metadata else 0
+        metadata = NodeMetadata(
+            node_id=new_node_id,
+            total_tokens=initial_tokens if is_leaf else 0,
+            extra_tokens=max(0, initial_tokens - parent_tokens) if is_leaf else 0,
+            search_path=search_path,
+            doc_ids=source_node.doc_ids if hasattr(source_node, 'doc_ids') else None,
+            is_leaf=is_leaf,
+            request_id=request_id
+        )
+        self.metadata[new_node_id] = metadata
+        
+        if is_leaf and request_id:
+            self._request_to_node[request_id] = new_node_id
+        
+        # Recursively copy children
+        if source_node.children:
+            for child_idx, child_id in enumerate(source_node.children):
+                child_search_path = search_path + [child_idx]
+                self._copy_subtree(
+                    source_nodes, child_id, new_node_id, 
+                    node_id_map, initial_tokens, child_search_path
+                )
+    
+    def _schedule_incremental(self, context_info: List[Tuple]) -> List[int]:
+        """
+        Schedule contexts for optimal execution based on search paths.
+        
+        Groups contexts by path prefix and orders by path length descending
+        to maximize cache reuse.
+        
+        Args:
+            context_info: List of (context_idx, request_id, search_path)
+            
+        Returns:
+            List of context indices in scheduled execution order
+        """
+        # Group by first element of search path
+        from collections import defaultdict
+        groups = defaultdict(list)
+        
+        for ctx_idx, req_id, path in context_info:
+            if path:
+                group_key = path[0]
+            else:
+                group_key = -1  # Empty path
+            groups[group_key].append((ctx_idx, len(path)))
+        
+        # Sort within each group by path length descending (longer paths first for cache reuse)
+        scheduled = []
+        for group_key in sorted(groups.keys()):
+            items = groups[group_key]
+            items.sort(key=lambda x: -x[1])
+            scheduled.extend([item[0] for item in items])
+        
+        return scheduled
+    
+    def _group_by_path_prefix(self, context_info: List[Tuple]) -> List[Tuple[int, List[int]]]:
+        """
+        Group contexts by search path prefix for execution.
+        
+        Args:
+            context_info: List of (context_idx, request_id, search_path)
+            
+        Returns:
+            List of (group_score, [context_indices])
+        """
+        from collections import defaultdict
+        groups = defaultdict(list)
+        
+        for ctx_idx, req_id, path in context_info:
+            if path:
+                group_key = path[0]
+            else:
+                group_key = -1
+            groups[group_key].append(ctx_idx)
+        
+        # Convert to list of (score, indices) tuples
+        result = []
+        for group_key, indices in groups.items():
+            score = len(indices)  # Simple score based on group size
+            result.append((score, indices))
+        
+        # Sort by score descending
+        result.sort(key=lambda x: -x[0])
+        return result
+
+    def schedule_only(self, contexts: List[List[int]]) -> Dict:
+        """
+        Schedule contexts for optimal execution (STATELESS MODE).
+        
+        This performs clustering and scheduling WITHOUT initializing live metadata.
+        Use this for batch processing where you don't need cache tracking.
+        
+        Workflow:
+        1. fit_transform() - build tree and reorder contexts
+        2. Inter-context scheduling - optimize execution order
+        3. Return results WITHOUT going live
+        
+        Args:
+            contexts: List of contexts (each is a list of document IDs)
+            
+        Returns:
+            Dictionary with scheduled results (no request_id mapping)
+        """
+        print("=" * 80)
+        print("SCHEDULING BATCH (STATELESS MODE)")
+        print("=" * 80)
+        
+        # Step 1: Build static index (clustering + reordering)
+        print("\n1. Building static index...")
+        result = self.fit_transform(contexts)
+        
+        print(f"   ✓ Built tree with {result.stats['total_nodes']} nodes")
+        print(f"   ✓ Leaf nodes: {result.stats['leaf_nodes']}")
+        
+        # Step 2: Inter-context scheduling
+        print("\n2. Scheduling contexts for optimal execution...")
+        scheduled_reordered, scheduled_originals, final_mapping, groups = \
+            self.inter_scheduler.schedule_contexts(result)
+        
+        print(f"   ✓ Created {len(groups)} execution groups")
+        
+        # Return results without going live (stateless)
+        scheduled_result = {
+            'scheduled_reordered': scheduled_reordered,
+            'scheduled_originals': scheduled_originals,
+            'final_mapping': final_mapping,
+            'groups': groups,
+            'stats': {
+                'total_nodes': result.stats['total_nodes'],
+                'leaf_nodes': result.stats['leaf_nodes'],
+                'num_contexts': len(contexts),
+                'num_groups': len(groups),
+            }
+        }
+        
+        print("\n" + "=" * 80)
+        print("✓ BATCH SCHEDULED (Stateless - no cache tracking)")
+        print("=" * 80 + "\n")
+        
+        return scheduled_result
+    
+    def _initialize_live_metadata(self, initial_tokens_per_context: int, num_input_contexts: int = None) -> Tuple[Dict[str, int], List[str]]:
         """
         Initialize metadata for all nodes after static index is built.
         
@@ -197,6 +669,7 @@ class LiveContextIndex(ContextIndex):
         
         Args:
             initial_tokens_per_context: Initial token count for each context
+            num_input_contexts: Number of input contexts (for generating request_ids list)
             
         Returns:
             Tuple of:
@@ -269,17 +742,21 @@ class LiveContextIndex(ContextIndex):
             
             self.metadata[node_id] = metadata
             
-            # Add leaf nodes to eviction heap and tracking
+            # Track leaf nodes
             if is_leaf and request_id:
                 self._request_to_node[request_id] = node_id
-                self.eviction_heap.push(metadata)
                 request_id_mapping[request_id] = node_id
         
         self.next_node_id = max(self.nodes.keys()) + 1 if self.nodes else 0
         self._next_request_counter = leaf_counter  # Track for future inserts
         
-        # Build ordered list of request_ids matching original context order
-        num_contexts = len(original_index_to_request_id)
+        # Build ordered list of request_ids matching INPUT context order
+        # Use num_input_contexts if provided, otherwise use original_index_to_request_id length
+        if num_input_contexts is not None:
+            num_contexts = num_input_contexts
+        else:
+            num_contexts = len(original_index_to_request_id)
+        
         request_ids_ordered = [
             original_index_to_request_id.get(i) for i in range(num_contexts)
         ]
@@ -287,154 +764,71 @@ class LiveContextIndex(ContextIndex):
         return request_id_mapping, request_ids_ordered
     
     # =========================================================================
-    # Token Tracking (For SGLang Integration)
+    # Request Eviction (Called by SGLang's radix cache callback)
     # =========================================================================
     
-    def update_tokens(self, request_id: str, num_tokens: int) -> Dict[str, Any]:
+    def remove_requests(self, request_ids: Set[str]) -> Dict[str, Any]:
         """
-        Update token count for a request.
+        Remove requests from the context index.
         
-        THIS IS THE ENDPOINT SGLANG SHOULD CALL TO UPDATE THE EVICTION HEAP.
+        THIS IS THE METHOD CALLED BY SGLANG'S EVICTION CALLBACK.
         
-        When SGLang processes a request, call this to update the token count.
-        If the heap exceeds max_tokens, eviction is triggered automatically.
+        When SGLang's radix cache evicts requests, it calls a callback
+        with the set of evicted request_ids. That callback should invoke
+        this method to keep the context index in sync.
         
         Args:
-            request_id: The unique request identifier (from build/insert response)
-            num_tokens: Total tokens for this request (input + output)
+            request_ids: Set of request IDs to remove (from SGLang callback)
             
         Returns:
-            Dictionary with update results and any eviction that occurred
+            Dictionary with eviction results
         """
-        result = {
-            'request_id': request_id,
-            'num_tokens': num_tokens,
-            'updated': False,
-            'eviction_triggered': False,
-            'evicted_requests': []
-        }
-        
-        # Find the node for this request
-        node_id = self._request_to_node.get(request_id)
-        if node_id is None:
-            return result
-        
-        metadata = self.metadata.get(node_id)
-        if metadata is None:
-            return result
-        
-        # Update token count
-        # For leaf nodes, extra_tokens = total_tokens - parent_tokens
-        # When we update total_tokens, extra_tokens changes by the same delta
-        old_tokens = metadata.total_tokens
-        old_extra = metadata.extra_tokens
-        delta = num_tokens - old_tokens
-        
-        if delta > 0:
-            metadata.add_tokens(delta)
-        elif delta < 0:
-            metadata.remove_tokens(abs(delta))
-        
-        # extra_tokens also changes by delta (parent tokens stay the same)
-        new_extra = metadata.extra_tokens
-        extra_delta = new_extra - old_extra
-        
-        metadata.update_access_time()
-        self.eviction_heap.update_access_time(node_id)
-        
-        # Update heap's total token tracking (heap tracks extra_tokens, not total)
-        self.eviction_heap._total_tokens += extra_delta
-        
-        result['updated'] = True
-        result['previous_tokens'] = old_tokens
-        result['current_tokens'] = num_tokens
-        result['extra_tokens'] = new_extra
-        self.live_stats['total_token_updates'] += 1
-        
-        # Log the token update for debugging
-        import logging
-        logger = logging.getLogger(__name__)
-        logger.info(
-            f"Token update: request_id={request_id}, node_id={node_id}, "
-            f"total: {old_tokens} -> {num_tokens}, extra: {old_extra} -> {new_extra}, "
-            f"heap_total={self.eviction_heap.total_tokens()}, "
-            f"max_tokens={self._max_tokens}"
-        )
-        
-        # Check if eviction is needed
-        if self.eviction_heap.needs_eviction():
-            tokens_to_evict = self.eviction_heap.tokens_to_evict()
-            eviction_result = self.evict(tokens_to_evict)
-            
-            result['eviction_triggered'] = True
-            result['evicted_requests'] = eviction_result.get('evicted_request_ids', [])
-            result['tokens_evicted'] = eviction_result.get('tokens_evicted', 0)
-            result['heap_tokens_after'] = self.eviction_heap.total_tokens()
-        
-        return result
-    
-    def touch(self, request_id: str) -> bool:
-        """
-        Update access time for a request (LRU sync with SGLang).
-        
-        Call this when SGLang accesses a cached prefix to keep
-        the eviction heap's LRU ordering in sync.
-        
-        Args:
-            request_id: The unique request identifier
-            
-        Returns:
-            True if request was found and touched, False otherwise
-        """
-        node_id = self._request_to_node.get(request_id)
-        if node_id is None:
-            return False
-        
-        metadata = self.metadata.get(node_id)
-        if metadata is None:
-            return False
-        
-        # Update access time
-        old_time = metadata.last_access_time
-        metadata.update_access_time()
-        self.eviction_heap.update_access_time(node_id)
-        
-        self.live_stats['total_touches'] = self.live_stats.get('total_touches', 0) + 1
-        
-        # Log the touch for debugging
-        import logging
-        logger = logging.getLogger(__name__)
-        logger.info(
-            f"Touch: request_id={request_id}, node_id={node_id}, "
-            f"access_time: {old_time:.3f} -> {metadata.last_access_time:.3f}, "
-            f"heap_size={len(self.eviction_heap)}, total_tokens={self.eviction_heap.total_tokens()}"
-        )
-        
-        return True
-    
-    def touch_batch(self, request_ids: List[str]) -> Dict[str, Any]:
-        """
-        Update access time for multiple requests at once.
-        
-        Args:
-            request_ids: List of request IDs to touch
-            
-        Returns:
-            Dictionary with touched and not_found counts
-        """
-        touched = 0
+        evicted_nodes = []
         not_found = []
         
         for request_id in request_ids:
-            if self.touch(request_id):
-                touched += 1
-            else:
+            node_id = self._request_to_node.get(request_id)
+            if node_id is None:
                 not_found.append(request_id)
+                continue
+            
+            # Remove from tracking
+            del self._request_to_node[request_id]
+            evicted_nodes.append(node_id)
+            
+            # Remove node and prune empty parents
+            self._remove_node_and_prune(node_id)
+        
+        self.live_stats['total_evictions'] += len(evicted_nodes)
+        
+        logger.info(
+            f"Removed {len(evicted_nodes)} requests from context index, "
+            f"{len(not_found)} not found"
+        )
         
         return {
-            'touched': touched,
-            'not_found': not_found
+            'removed_count': len(evicted_nodes),
+            'evicted_node_ids': evicted_nodes,
+            'evicted_request_ids': list(set(request_ids) - set(not_found)),
+            'not_found': not_found,
+            'nodes_remaining': len(self.nodes),
+            'requests_remaining': len(self._request_to_node)
         }
+    
+    def remove_request_by_id(self, request_id: str) -> bool:
+        """
+        Remove a single request from the context index.
+        
+        Convenience method for removing one request at a time.
+        
+        Args:
+            request_id: The request ID to remove
+            
+        Returns:
+            True if request was found and removed, False otherwise
+        """
+        result = self.remove_requests({request_id})
+        return len(result['evicted_node_ids']) > 0
     
     def get_request_node(self, request_id: str) -> Optional[int]:
         """
@@ -448,98 +842,128 @@ class LiveContextIndex(ContextIndex):
         """
         return self._request_to_node.get(request_id)
     
-    def get_all_request_ids(self) -> Set[str]:
-        """Get all tracked request IDs."""
-        return set(self._request_to_node.keys())
+    def _collect_all_node_docs(self) -> Tuple[List[int], List[List[int]], Dict[int, List[int]]]:
+        """
+        Collect doc_ids from all nodes in the tree.
+        
+        Returns:
+            Tuple of (node_ids, node_docs_list, node_id_to_path)
+        """
+        node_ids = []
+        node_docs_list = []
+        node_id_to_path = {}
+        
+        # BFS to collect all nodes
+        queue = deque([(self.root_id, [])])
+        
+        while queue:
+            node_id, path = queue.popleft()
+            
+            if node_id not in self.nodes:
+                continue
+            
+            node = self.nodes[node_id]
+            node_meta = self.metadata.get(node_id)
+            
+            if node_meta and node_meta.doc_ids:
+                docs = node_meta.doc_ids
+            elif hasattr(node, 'doc_ids') and node.doc_ids:
+                docs = node.doc_ids
+            else:
+                docs = None
+            
+            if docs:
+                node_ids.append(node_id)
+                node_docs_list.append(docs)
+                node_id_to_path[node_id] = path
+            
+            # Add children to queue
+            if not node.is_leaf and node.children:
+                for idx, child_id in enumerate(node.children):
+                    queue.append((child_id, path + [idx]))
+        
+        return node_ids, node_docs_list, node_id_to_path
+    
+    def search_batch(self, contexts: List[List[int]]) -> List[Tuple[List[int], int, int]]:
+        """
+        Batch search for best matching nodes for multiple contexts.
+        
+        Much faster than calling search() multiple times as it:
+        1. Collects all node docs once
+        2. Computes all distances in parallel using batch computation
+        3. Finds best match for each context
+        
+        Args:
+            contexts: List of query contexts
+            
+        Returns:
+            List of (search_path, matched_node_id, overlap_count) for each context
+        """
+        start_time = time.perf_counter()
+        
+        if self.root_id is None or not contexts:
+            return [([], -1, 0) for _ in contexts]
+        
+        # Collect all node docs
+        node_ids, node_docs_list, node_id_to_path = self._collect_all_node_docs()
+        
+        if not node_ids:
+            return [([], -1, 0) for _ in contexts]
+        
+        # Batch compute distances: (num_contexts x num_nodes)
+        distances = compute_distances_batch(contexts, node_docs_list, self.alpha)
+        
+        # For each context, find best matching node
+        results = []
+        for i, context in enumerate(contexts):
+            context_set = set(context)
+            best_node_idx = -1
+            best_distance = float('inf')
+            best_overlap = 0
+            
+            for j, (node_id, docs) in enumerate(zip(node_ids, node_docs_list)):
+                dist = distances[i, j]
+                overlap = len(context_set & set(docs))
+                
+                if overlap > 0 and dist < best_distance:
+                    best_distance = dist
+                    best_overlap = overlap
+                    best_node_idx = j
+            
+            if best_node_idx >= 0:
+                best_node_id = node_ids[best_node_idx]
+                best_path = node_id_to_path[best_node_id]
+                results.append((best_path, best_node_id, best_overlap))
+            else:
+                results.append(([], -1, 0))
+        
+        # Update statistics
+        elapsed_us = (time.perf_counter() - start_time) * 1_000_000
+        self.live_stats['total_searches'] += len(contexts)
+        self.live_stats['total_search_time_us'] += elapsed_us
+        
+        return results
     
     def search(self, context: List[int], update_access: bool = True) -> Tuple[List[int], int, int]:
         """
-        Search for best matching node using greedy descent.
-        
-        Algorithm:
-        1. Start at root
-        2. At each level, select child with minimum distance
-        3. Stop at leaf or when all children are equidistant
-        4. Return search path and matched node
-        
-        Complexity: O(|C| · log n)
+        Search for best matching node for a single context.
+        For multiple contexts, use search_batch() instead.
         
         Args:
             context: Query context (list of document IDs)
             update_access: Whether to update LRU timestamp
             
         Returns:
-            Tuple of (search_path, matched_node_id, shared_prefix_length)
+            Tuple of (search_path, matched_node_id, overlap_count)
         """
-        start_time = time.perf_counter()
-        
-        if self.root_id is None:
-            return ([], -1, 0)
-        
-        current_id = self.root_id
-        search_path = []
-        
-        while current_id is not None:
-            current_node = self.nodes[current_id]
-            
-            # If leaf, we're done
-            if current_node.is_leaf:
-                break
-            
-            # If no children, stop here
-            if not current_node.children:
-                break
-            
-            # Find child with minimum distance
-            min_distance = float('inf')
-            best_child_idx = None
-            distances = []
-            
-            for idx, child_id in enumerate(current_node.children):
-                if child_id not in self.nodes:
-                    continue
-                
-                child_node = self.nodes[child_id]
-                child_docs = self.metadata[child_id].doc_ids or child_node.doc_ids
-                
-                # Compute prefix length (shared tokens)
-                prefix_len = compute_prefix_length(context, child_docs)
-                distance = len(context) - prefix_len  # Distance = non-matching tokens
-                
-                distances.append(distance)
-                
-                if distance < min_distance:
-                    min_distance = distance
-                    best_child_idx = idx
-            
-            # Check if all children are equidistant
-            if distances and all(d == distances[0] for d in distances):
-                # All equidistant, stop here (longest shared prefix found)
-                break
-            
-            # Descend to best child
-            if best_child_idx is not None:
-                search_path.append(best_child_idx)
-                current_id = current_node.children[best_child_idx]
-            else:
-                break
-        
-        # Compute shared prefix length with matched node
-        matched_node = self.nodes[current_id]
-        matched_docs = self.metadata[current_id].doc_ids or matched_node.doc_ids
-        shared_prefix_length = compute_prefix_length(context, matched_docs) if matched_docs else 0
+        results = self.search_batch([context])
+        search_path, node_id, overlap = results[0]
         
         # Update access time
-        if update_access and current_id in self.metadata:
-            self.metadata[current_id].update_access_time()
-            self.eviction_heap.update_access_time(current_id)
+        if update_access and node_id >= 0 and node_id in self.metadata:
+            self.metadata[node_id].update_access_time()
         
-        # Update statistics
-        elapsed_us = (time.perf_counter() - start_time) * 1_000_000
-        self.live_stats['total_searches'] += 1
-        self.live_stats['total_search_time_us'] += elapsed_us
-        
-        return (search_path, current_id, shared_prefix_length)
+        return (search_path, node_id, overlap)
     
     def traverse(self, search_path: List[int]) -> Optional[ClusterNode]:
         """
@@ -657,7 +1081,6 @@ class LiveContextIndex(ContextIndex):
         
         self.metadata[self.next_node_id] = metadata
         self._request_to_node[request_id] = self.next_node_id
-        self.eviction_heap.push(metadata)
         
         new_search_path = search_path + [len(parent_node.children) - 1]
         new_node_id = self.next_node_id
@@ -716,7 +1139,6 @@ class LiveContextIndex(ContextIndex):
         )
         self.metadata[new_leaf_id] = new_metadata
         self._request_to_node[request_id] = new_leaf_id
-        self.eviction_heap.push(new_metadata)
         
         return (new_leaf_id, new_search_path, request_id)
     
@@ -740,129 +1162,10 @@ class LiveContextIndex(ContextIndex):
         
         if token_delta > 0:
             metadata.add_tokens(token_delta)
-            self.eviction_heap.update_access_time(node.node_id)
         else:
             metadata.remove_tokens(abs(token_delta))
         
-        self.live_stats['total_updates'] += 1
-        
         return True
-    
-    def evict(self, num_tokens: int) -> Dict[str, Any]:
-        """
-        Evict tokens from LRU nodes to sync with SGLang's cache eviction.
-        
-        THIS IS THE API THAT SGLANG SHOULD CALL WHEN IT EVICTS CACHE.
-        
-        When SGLang's radix_cache.evict(num_tokens) is called, SGLang should
-        also call this method with the same num_tokens to keep our index in sync.
-        
-        Integration point in SGLang:
-            # In scheduler_batch.py or wherever eviction happens
-            def evict_from_tree_cache(tree_cache, num_tokens):
-                tree_cache.evict(num_tokens)
-                
-                # Add this line to sync with RAGBoost index
-                if hasattr(self, 'ragboost_index') and self.ragboost_index is not None:
-                    self.ragboost_index.evict(num_tokens)
-        
-        Process:
-        1. Pop LRU nodes from heap
-        2. Decrement token counts
-        3. Remove nodes with zero tokens
-        4. Recursively delete empty parents
-        
-        Args:
-            num_tokens: Number of tokens to evict (same as SGLang's eviction)
-            
-        Returns:
-            Dictionary with eviction statistics:
-                - evicted_node_ids: List of node IDs that were completely evicted
-                - evicted_request_ids: List of request_ids that were evicted
-                - tokens_evicted: Total number of tokens actually evicted (extra_tokens only)
-                - nodes_remaining: Number of nodes still in the index
-                - tokens_remaining: Total tokens remaining in the index
-        """
-        evicted_nodes = []
-        evicted_request_ids = []
-        tokens_evicted = 0
-        
-        # Keep evicting whole leaves until we've freed enough tokens
-        while tokens_evicted < num_tokens and not self.eviction_heap.is_empty():
-            # Get LRU leaf node (only leaves with request_id are in heap)
-            lru_metadata = self.eviction_heap.pop()
-            
-            if lru_metadata is None:
-                break
-            
-            node_id = lru_metadata.node_id
-            request_id = lru_metadata.request_id
-            
-            # Evict this WHOLE leaf - count its extra_tokens as freed
-            # (We can't partially evict - either the whole leaf is cached or not)
-            leaf_extra_tokens = lru_metadata.extra_tokens
-            tokens_evicted += leaf_extra_tokens
-            
-            # Track evicted request
-            if request_id:
-                evicted_request_ids.append(request_id)
-                if request_id in self._request_to_node:
-                    del self._request_to_node[request_id]
-            
-            evicted_nodes.append(node_id)
-            
-            # Remove leaf and prune empty parents
-            # This may free additional tokens from shared prefixes that are no longer used
-            parent_tokens_freed = self._remove_node_and_prune(node_id)
-            tokens_evicted += parent_tokens_freed
-        
-        self.live_stats['total_evictions'] += len(evicted_nodes)
-        
-        return {
-            'evicted_node_ids': evicted_nodes,
-            'evicted_request_ids': evicted_request_ids,
-            'tokens_evicted': tokens_evicted,
-            'nodes_remaining': len(self.nodes),
-            'tokens_remaining': self.eviction_heap.total_tokens(),
-            'requests_remaining': len(self._request_to_node)
-        }
-    
-    def get_eviction_stats(self) -> Dict[str, Any]:
-        """
-        Get current eviction-related statistics.
-        
-        Useful for monitoring and debugging the synchronization between
-        SGLang's cache and our index.
-        
-        Returns:
-            Dictionary with current state:
-                - total_nodes: Total nodes in the index
-                - active_nodes: Nodes with tokens > 0
-                - total_tokens: Sum of all tokens in the index
-                - max_tokens: Maximum token capacity
-                - utilization_pct: Current utilization percentage
-                - heap_size: Number of nodes in eviction heap
-                - num_requests: Number of tracked requests
-                - oldest_access_time: Timestamp of LRU node
-        """
-        total_tokens = self.eviction_heap.total_tokens()
-        stats = {
-            'total_nodes': len(self.nodes),
-            'active_nodes': len(self.metadata),
-            'total_tokens': total_tokens,
-            'max_tokens': self._max_tokens,
-            'utilization_pct': (total_tokens / self._max_tokens * 100) if self._max_tokens else 0,
-            'heap_size': len(self.eviction_heap),
-            'num_requests': len(self._request_to_node),
-            'oldest_access_time': None
-        }
-        
-        # Get oldest access time (LRU node)
-        lru_node = self.eviction_heap.peek()
-        if lru_node:
-            stats['oldest_access_time'] = lru_node.last_access_time
-        
-        return stats
     
     def _remove_node(self, node_id: int):
         """
@@ -877,20 +1180,27 @@ class LiveContextIndex(ContextIndex):
         """
         Remove a node and recursively delete empty parents.
         
-        When a leaf is removed, if its parent has no other children,
-        the parent's tokens (shared prefix) can also be freed.
-        This continues up the tree.
+        This mirrors SGLang's radix cache eviction behavior:
+        - When a leaf is evicted, SGLang checks if the parent becomes childless
+        - If parent has no children and lock_ref==0, it's pushed to eviction heap
+        - Parent is then evicted in the same evict() cycle
+        
+        So when we receive notification that a request was evicted, we should:
+        1. Remove that request's node
+        2. Prune any parent nodes that become childless
+        
+        This keeps the context index in sync with SGLang's actual cache state.
         
         Args:
             node_id: Node to remove
             
         Returns:
-            Total tokens freed from pruned parent nodes (shared prefix tokens)
+            Number of additional nodes pruned (parent nodes that became empty)
         """
         if node_id not in self.nodes:
             return 0
         
-        tokens_freed = 0
+        nodes_pruned = 0
         node = self.nodes[node_id]
         parent_id = node.parent
         
@@ -901,12 +1211,11 @@ class LiveContextIndex(ContextIndex):
                 parent.children.remove(node_id)
             
             # Recursively remove empty parents (not root)
-            # When parent becomes childless, its tokens (shared prefix) are freed
+            # This mirrors SGLang behavior: when a leaf is evicted and parent
+            # becomes childless, SGLang evicts the parent too in the same cycle
             if not parent.children and not parent.is_root:
-                if parent_id in self.metadata:
-                    # Parent's extra_tokens are now freed (no longer shared)
-                    tokens_freed += self.metadata[parent_id].extra_tokens
-                tokens_freed += self._remove_node_and_prune(parent_id)
+                nodes_pruned += 1
+                nodes_pruned += self._remove_node_and_prune(parent_id)
         
         # Delete node
         del self.nodes[node_id]
@@ -914,9 +1223,7 @@ class LiveContextIndex(ContextIndex):
         if node_id in self.metadata:
             del self.metadata[node_id]
         
-        self.eviction_heap.remove(node_id)
-        
-        return tokens_freed
+        return nodes_pruned
     
     def _compute_search_path(self, node_id: int) -> List[int]:
         """Compute search path from root to node."""
@@ -964,20 +1271,18 @@ class LiveContextIndex(ContextIndex):
         """Get index statistics."""
         avg_search_time = (self.live_stats['total_search_time_us'] / self.live_stats['total_searches'] 
                           if self.live_stats['total_searches'] > 0 else 0)
-        avg_traversal_time = (self.live_stats['total_traversal_time_us'] / 
-                             (self.live_stats['total_searches'] + self.live_stats['total_updates'])
-                             if (self.live_stats['total_searches'] + self.live_stats['total_updates']) > 0 else 0)
+        
+        # Calculate total extra tokens from metadata
+        total_tokens = sum(m.extra_tokens for m in self.metadata.values())
         
         return {
             'num_nodes': len(self.nodes),
             'active_nodes': len(self.metadata),
-            'total_tokens': self.eviction_heap.total_tokens(),
-            'heap_size': len(self.eviction_heap),
+            'total_tokens': total_tokens,
+            'num_requests': len(self._request_to_node),
             'total_searches': self.live_stats['total_searches'],
             'total_insertions': self.live_stats['total_insertions'],
-            'total_updates': self.live_stats['total_updates'],
-            'total_evictions': self.live_stats['total_evictions'],
+            'total_removals': self.live_stats.get('total_removals', 0),
             'avg_search_time_us': avg_search_time,
-            'avg_traversal_time_us': avg_traversal_time,
-            **self.eviction_heap.get_stats()
         }
+
