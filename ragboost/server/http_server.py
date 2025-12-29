@@ -5,6 +5,7 @@ A FastAPI-based HTTP server that:
 1. Exposes the LiveContextIndex as a REST API
 2. Proxies LLM requests to SGLang backend
 3. Automatically tracks tokens and triggers eviction
+4. Multi-turn conversation context deduplication
 
 Usage:
     python -m ragboost.server.http_server --port 8765 --max-tokens 1000000 --sglang-url http://localhost:30000
@@ -36,6 +37,12 @@ except ImportError:
     )
 
 from .live_index import LiveContextIndex
+from .conversation_tracker import (
+    ConversationTracker, 
+    DeduplicationResult,
+    get_conversation_tracker,
+    reset_conversation_tracker
+)
 
 logger = logging.getLogger(__name__)
 
@@ -56,13 +63,18 @@ _sglang_url: Optional[str] = None
 _aiohttp_session: Optional[aiohttp.ClientSession] = None
 _tokenizer = None  # AutoTokenizer instance for chat template
 _model_name: Optional[str] = None  # Model name for tokenizer
+_stateless_mode: bool = False  # Stateless mode: just clustering/scheduling, no cache tracking
 
 
 def _init_config():
     """Initialize config from environment variables."""
-    global _max_tokens, _sglang_url, _tokenizer, _model_name
+    global _max_tokens, _sglang_url, _tokenizer, _model_name, _stateless_mode
 
-    if _max_tokens is None:
+    # Check stateless mode first
+    env_stateless = os.environ.get("RAGBOOST_STATELESS_MODE", "0")
+    _stateless_mode = env_stateless == "1"
+
+    if _max_tokens is None and not _stateless_mode:
         env_max_tokens = os.environ.get("RAGBOOST_MAX_TOKENS")
         if env_max_tokens:
             _max_tokens = int(env_max_tokens)
@@ -95,12 +107,40 @@ class BuildIndexRequest(BaseModel):
     alpha: float = Field(0.005, description="Distance computation parameter")
     use_gpu: bool = Field(False, description="Use GPU for distance computation")
     linkage_method: str = Field("average", description="Linkage method for clustering")
+    incremental: bool = Field(
+        False, description="If True and index exists, do incremental build (search, reorder, merge)"
+    )
+    # Multi-turn deduplication fields
+    parent_request_ids: Optional[List[Optional[str]]] = Field(
+        None, 
+        description="List of parent request IDs for multi-turn deduplication. "
+                    "Each element corresponds to a context. None means turn 1 (no parent)."
+    )
+    deduplicate: bool = Field(
+        False,
+        description="If True, deduplicate contexts based on conversation history"
+    )
+    hint_template: Optional[str] = Field(
+        None,
+        description="Template for reference hints. Use {doc_id} and {turn_number} placeholders."
+    )
+
+
+class ScheduleRequest(BaseModel):
+    """Request to schedule a batch (stateless mode - no cache tracking)."""
+
+    contexts: List[List[Any]] = Field(
+        ..., description="List of contexts (each is a list of document IDs)"
+    )
+    alpha: float = Field(0.005, description="Distance computation parameter")
+    use_gpu: bool = Field(False, description="Use GPU for distance computation")
+    linkage_method: str = Field("average", description="Linkage method for clustering")
 
 
 class EvictRequest(BaseModel):
-    """Request to evict tokens."""
+    """Request to evict (remove) requests from the index."""
 
-    num_tokens: int = Field(..., gt=0, description="Number of tokens to evict")
+    request_ids: List[str] = Field(..., description="List of request IDs to evict/remove")
 
 
 class SearchRequest(BaseModel):
@@ -108,15 +148,6 @@ class SearchRequest(BaseModel):
 
     context: List[Any] = Field(..., description="Query context (list of document IDs)")
     update_access: bool = Field(True, description="Whether to update LRU timestamp")
-
-
-class UpdateNodeRequest(BaseModel):
-    """Request to update a node's token count."""
-
-    search_path: List[int] = Field(..., description="Path to the node")
-    token_delta: int = Field(
-        ..., description="Tokens to add (positive) or remove (negative)"
-    )
 
 
 class InsertRequest(BaseModel):
@@ -127,37 +158,20 @@ class InsertRequest(BaseModel):
     total_tokens: int = Field(0, description="Initial token count")
 
 
-class RegisterRequestModel(BaseModel):
-    """DEPRECATED - Request IDs are now auto-generated during build/insert."""
-
-    request_id: str = Field(..., description="Unique identifier for the request")
-    node_id: int = Field(..., description="The leaf node ID in the context index")
-
-
-class UpdateTokensRequest(BaseModel):
-    """Request to update token count for a request (SGLang integration)."""
-
-    request_id: str = Field(
-        ..., description="The request ID (from build/insert response)"
+class DeduplicateRequest(BaseModel):
+    """Request to deduplicate contexts for multi-turn conversations."""
+    
+    contexts: List[List[Any]] = Field(
+        ..., description="List of contexts (each is a list of document IDs)"
     )
-    num_tokens: int = Field(
-        ..., ge=0, description="Total number of tokens for this request"
+    parent_request_ids: List[Optional[str]] = Field(
+        ..., 
+        description="List of parent request IDs. Each element corresponds to a context. "
+                    "None means turn 1 (no parent, will be registered for future dedup)."
     )
-
-
-class TouchRequest(BaseModel):
-    """Request to update access time for a request (LRU sync with SGLang)."""
-
-    request_id: str = Field(
-        ..., description="The request ID to touch"
-    )
-
-
-class TouchBatchRequest(BaseModel):
-    """Request to update access time for multiple requests."""
-
-    request_ids: List[str] = Field(
-        ..., description="List of request IDs to touch"
+    hint_template: Optional[str] = Field(
+        None,
+        description="Template for reference hints. Use {doc_id} and {turn_number} placeholders."
     )
 
 
@@ -171,7 +185,9 @@ async def lifespan(app: FastAPI):
     _init_config()
 
     logger.info("RAGBoost Index Server starting...")
-    logger.info(f"  max_tokens: {_max_tokens}")
+    logger.info(f"  stateless_mode: {_stateless_mode}")
+    if not _stateless_mode:
+        logger.info(f"  max_tokens: {_max_tokens}")
     logger.info(f"  sglang_url: {_sglang_url}")
 
     _aiohttp_session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=3600))
@@ -195,6 +211,7 @@ async def root():
     return {
         "service": "RAGBoost Live Index Server",
         "status": "running",
+        "mode": "stateless" if _stateless_mode else "live",
         "index_initialized": _index is not None,
         "timestamp": time.time(),
     }
@@ -207,6 +224,16 @@ async def health():
 
     # Ensure config is initialized from env vars
     _init_config()
+
+    # Stateless mode health check
+    if _stateless_mode:
+        return {
+            "status": "ready",
+            "mode": "stateless",
+            "eviction_enabled": False,
+            "message": "Stateless mode: clustering and scheduling only, no cache tracking",
+            "timestamp": time.time(),
+        }
 
     if _index is None:
         return JSONResponse(
@@ -223,6 +250,7 @@ async def health():
     # max_tokens is guaranteed to be set
     return {
         "status": "ready",
+        "mode": "live",
         "eviction_enabled": True,
         "max_tokens": _max_tokens,
         "current_tokens": current_tokens,
@@ -235,35 +263,102 @@ async def health():
 @app.post("/build")
 async def build_index(request: BuildIndexRequest):
     """
-    Build and initialize the index.
+    Build and initialize the index, or incrementally update existing index.
 
-    This should be called once at startup before any other operations.
-    Note: max_tokens is set when the server starts via --max-tokens argument.
+    Two modes:
+    1. Initial build (incremental=False or no existing index):
+       - Creates new index from scratch
+       - Performs clustering and scheduling
+       - Auto-generates request_ids for all contexts
+       
+    2. Incremental build (incremental=True and index exists):
+       - Reorders matched contexts to align with existing prefix structure
+       - Builds a separate index for unmatched contexts
+       - Merges new index subtrees under the global root
+       - Returns NEW request_ids for all contexts
 
-    Auto-generates unique request_ids for each leaf node (context).
-    The response includes a mapping from request_id -> node_id that can be used
-    to track tokens via POST /update_tokens.
+    Multi-turn deduplication (deduplicate=True):
+       - Compares contexts against conversation history
+       - Returns deduplicated_contexts with overlapping docs removed
+       - Returns reference_hints for each deduplicated document
+
+    The response includes an ordered list of request_ids matching input contexts order.
+    These request_ids should be used when sending requests to SGLang so that
+    the eviction callback can notify RAGBoost which contexts were evicted.
     """
-    global _index, _max_tokens
+    global _index
 
     # Ensure config is initialized from env vars
     _init_config()
 
-    if _max_tokens is None:
-        raise HTTPException(
-            status_code=500,
-            detail="Server not configured with max_tokens. Restart server with --max-tokens argument.",
-        )
-
     try:
+        # Check if incremental mode is requested and index exists
+        if request.incremental and _index is not None and _index.is_live:
+            logger.info(f"Incremental build with {len(request.contexts)} contexts...")
+            
+            result = _index.build_incremental(
+                contexts=request.contexts,
+                initial_tokens_per_context=request.initial_tokens_per_context,
+            )
+            
+            logger.info(
+                f"Incremental build: {result['matched_count']} matched+inserted, "
+                f"{result['merged_count']} built+merged"
+            )
+            
+            # Multi-turn deduplication if requested
+            dedup_results = None
+            if request.deduplicate:
+                tracker = get_conversation_tracker()
+                dedup_results = tracker.deduplicate_batch(
+                    request_ids=result['request_ids'],
+                    docs_list=result.get('reordered_contexts') or request.contexts,
+                    parent_request_ids=request.parent_request_ids,
+                    hint_template=request.hint_template
+                )
+                logger.info(f"Deduplication: processed {len(dedup_results)} contexts")
+            
+            response = {
+                "status": "success",
+                "message": "Incremental build completed",
+                "mode": "incremental",
+                "num_contexts": len(request.contexts),
+                "matched_count": result['matched_count'],
+                "merged_count": result['merged_count'],
+                "request_ids": result['request_ids'],
+                "reordered_contexts": result.get('reordered_contexts'),
+                "scheduled_order": result['scheduled_order'],
+                "groups": result['groups'],
+                "stats": _index.get_stats(),
+            }
+            
+            # Add deduplication results if requested
+            if dedup_results:
+                response["deduplication"] = {
+                    "enabled": True,
+                    "results": [
+                        {
+                            "request_id": result['request_ids'][i],
+                            "original_docs": r.original_docs,
+                            "deduplicated_docs": r.deduplicated_docs,
+                            "overlapping_docs": r.overlapping_docs,
+                            "new_docs": r.new_docs,
+                            "reference_hints": r.reference_hints,
+                        }
+                        for i, r in enumerate(dedup_results)
+                    ],
+                    "total_docs_deduplicated": sum(len(r.overlapping_docs) for r in dedup_results),
+                }
+            
+            return response
+        
+        # Initial build
         logger.info(f"Building index with {len(request.contexts)} contexts...")
-        logger.info(f"Using max_tokens from server config: {_max_tokens:,}")
 
         _index = LiveContextIndex(
             alpha=request.alpha,
             use_gpu=request.use_gpu,
             linkage_method=request.linkage_method,
-            max_tokens=_max_tokens,  # Pass max_tokens to index
         )
 
         result = _index.build_and_schedule(
@@ -279,68 +374,218 @@ async def build_index(request: BuildIndexRequest):
         logger.info(
             f"Index built successfully. Auto-assigned {len(request_id_mapping)} request IDs"
         )
+        
+        # Multi-turn deduplication if requested (for initial build too)
+        dedup_results = None
+        if request.deduplicate:
+            tracker = get_conversation_tracker()
+            reordered = result.get('scheduled_reordered') or request.contexts
+            dedup_results = tracker.deduplicate_batch(
+                request_ids=request_ids,
+                docs_list=reordered,
+                parent_request_ids=request.parent_request_ids,
+                hint_template=request.hint_template
+            )
+            logger.info(f"Deduplication: processed {len(dedup_results)} contexts")
 
-        return {
+        response = {
             "status": "success",
             "message": "Index built successfully",
+            "mode": "initial",
             "num_contexts": len(request.contexts),
-            "max_tokens": _max_tokens,
-            "request_id_mapping": request_id_mapping,  # request_id -> node_id (dict)
-            "request_ids": request_ids,  # Ordered list matching input contexts
+            "matched_count": 0,
+            "inserted_count": len(request.contexts),
+            "request_id_mapping": request_id_mapping,
+            "request_ids": request_ids,
             "stats": _index.get_stats(),
         }
+        
+        # Add deduplication results if requested
+        if dedup_results:
+            response["deduplication"] = {
+                "enabled": True,
+                "results": [
+                    {
+                        "request_id": request_ids[i],
+                        "original_docs": r.original_docs,
+                        "deduplicated_docs": r.deduplicated_docs,
+                        "overlapping_docs": r.overlapping_docs,
+                        "new_docs": r.new_docs,
+                        "reference_hints": r.reference_hints,
+                    }
+                    for i, r in enumerate(dedup_results)
+                ],
+                "total_docs_deduplicated": sum(len(r.overlapping_docs) for r in dedup_results),
+            }
+        
+        return response
 
     except Exception as e:
         logger.error(f"Error building index: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/deduplicate")
+async def deduplicate_contexts(request: DeduplicateRequest):
+    """
+    Deduplicate contexts for multi-turn conversations without index operations.
+    
+    This is a lightweight endpoint designed for Turn 2+ in multi-turn conversations.
+    It only performs deduplication against conversation history - no index build/search.
+    
+    Flow:
+    1. Turn 1: Client calls /build (no parent_request_id, builds index, registers in tracker)
+    2. Turn 2+: Client calls /deduplicate (has parent_request_id, just deduplicates)
+    
+    For each context:
+    - If parent_request_id is None: Registers as a new conversation root (Turn 1)
+    - If parent_request_id is provided: Deduplicates against conversation history
+    
+    Returns deduplicated docs with reference hints for overlapping documents.
+    """
+    try:
+        tracker = get_conversation_tracker()
+        
+        # Validate input lengths match
+        if len(request.contexts) != len(request.parent_request_ids):
+            raise HTTPException(
+                status_code=400,
+                detail=f"contexts and parent_request_ids must have same length "
+                       f"(got {len(request.contexts)} vs {len(request.parent_request_ids)})"
+            )
+        
+        # Generate request_ids for this batch
+        import uuid
+        request_ids = [f"dedup_{uuid.uuid4().hex[:8]}" for _ in request.contexts]
+        
+        # Perform deduplication
+        dedup_results = tracker.deduplicate_batch(
+            request_ids=request_ids,
+            docs_list=request.contexts,
+            parent_request_ids=request.parent_request_ids,
+            hint_template=request.hint_template
+        )
+        
+        logger.info(
+            f"Deduplicated {len(request.contexts)} contexts, "
+            f"removed {sum(len(r.overlapping_docs) for r in dedup_results)} overlapping docs"
+        )
+        
+        return {
+            "status": "success",
+            "message": "Deduplication completed",
+            "request_ids": request_ids,
+            "results": [
+                {
+                    "request_id": request_ids[i],
+                    "parent_request_id": request.parent_request_ids[i],
+                    "original_docs": r.original_docs,
+                    "deduplicated_docs": r.deduplicated_docs,
+                    "overlapping_docs": r.overlapping_docs,
+                    "new_docs": r.new_docs,
+                    "reference_hints": r.reference_hints,
+                    "is_new_conversation": r.is_new_conversation,
+                }
+                for i, r in enumerate(dedup_results)
+            ],
+            "summary": {
+                "total_contexts": len(request.contexts),
+                "new_conversations": sum(1 for r in dedup_results if r.is_new_conversation),
+                "continued_conversations": sum(1 for r in dedup_results if not r.is_new_conversation),
+                "total_docs_deduplicated": sum(len(r.overlapping_docs) for r in dedup_results),
+            }
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in deduplication: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/schedule")
+async def schedule_batch(request: ScheduleRequest):
+    """
+    Schedule a batch of contexts (STATELESS MODE).
+
+    This endpoint performs clustering and scheduling WITHOUT tracking cache state.
+    Use this when you want to:
+    1. Just reorder contexts for optimal prefix sharing
+    2. Process batches independently without maintaining server state
+    3. Send scheduled contexts directly to LLM engine without cache sync
+
+    No cache tracking, eviction, or token updates required.
+    Each call is independent - perfect for batch processing.
+
+    Returns:
+        - scheduled_contexts: Reordered contexts for optimal prefix sharing
+        - original_indices: Mapping to original context indices
+        - groups: Execution groups with prefix sharing info
+    """
+    try:
+        logger.info(f"Scheduling batch with {len(request.contexts)} contexts (stateless mode)...")
+
+        # Create a temporary index just for clustering/scheduling
+        temp_index = LiveContextIndex(
+            alpha=request.alpha,
+            use_gpu=request.use_gpu,
+            linkage_method=request.linkage_method,
+            max_tokens=None,  # No max_tokens - stateless mode
+        )
+
+        # Build and schedule without live tracking
+        result = temp_index.schedule_only(
+            contexts=request.contexts,
+        )
+
+        logger.info(
+            f"Batch scheduled: {len(result['groups'])} groups, "
+            f"{len(request.contexts)} contexts reordered"
+        )
+
+        return {
+            "status": "success",
+            "message": "Batch scheduled successfully (stateless mode)",
+            "mode": "stateless",
+            "num_contexts": len(request.contexts),
+            "num_groups": len(result["groups"]),
+            "scheduled_contexts": result["scheduled_reordered"],
+            "original_indices": result["final_mapping"],
+            "groups": result["groups"],
+            "stats": result.get("stats", {}),
+        }
+
+    except Exception as e:
+        logger.error(f"Error scheduling batch: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.post("/evict")
 async def evict(request: EvictRequest):
     """
-    Evict tokens from the index.
+    Remove requests from the index (SGLang eviction callback integration).
 
-    THIS IS THE MAIN ENDPOINT THAT SGLANG SHOULD CALL FOR CACHE EVICTION SYNC.
+    THIS IS THE MAIN ENDPOINT THAT SGLANG'S EVICTION CALLBACK SHOULD CALL.
 
-    IMPORTANT: The index must be initialized with max_tokens parameter.
-    Call POST /build with max_tokens set before using this endpoint.
-
-    When SGLang evicts cache with tree_cache.evict(num_tokens), it should also
-    call this endpoint with the same num_tokens value.
+    When SGLang's radix_cache.evict() evicts nodes, it collects the request_ids
+    from the evicted nodes and invokes the registered callback. That callback
+    should call this endpoint to remove the corresponding entries from RAGBoost.
 
     Integration in SGLang:
-        import requests
-
-        def evict_tokens(self, num_tokens):
-            # SGLang's eviction
-            self.tree_cache.evict(num_tokens)
-
-            # Sync with RAGBoost index
-            try:
-                requests.post(
-                    "http://localhost:8765/evict",
-                    json={"num_tokens": num_tokens},
-                    timeout=1.0
-                )
-            except Exception as e:
-                logger.warning(f"RAGBoost eviction sync failed: {e}")
+        def eviction_callback(evicted_request_ids: set):
+            if evicted_request_ids:
+                try:
+                    requests.post(
+                        "http://localhost:8765/evict",
+                        json={"request_ids": list(evicted_request_ids)},
+                        timeout=1.0
+                    )
+                except Exception as e:
+                    logger.warning(f"RAGBoost eviction sync failed: {e}")
+        
+        # Register callback when initializing radix cache
+        tree_cache.set_eviction_callback(eviction_callback)
     """
-    global _max_tokens
-
-    # Ensure config is initialized from env vars
-    _init_config()
-
-    # Check if server was started with max_tokens
-    if _max_tokens is None:
-        raise HTTPException(
-            status_code=503,
-            detail=(
-                "Server not configured with max_tokens. "
-                "Restart server with --max-tokens argument. "
-                "Example: python -m ragboost.server.http_server --port 8765 --max-tokens 1000000"
-            ),
-        )
-
     # Check if index is initialized
     if _index is None:
         raise HTTPException(
@@ -348,30 +593,69 @@ async def evict(request: EvictRequest):
         )
 
     try:
-        # Get current stats before eviction
-        current_tokens = _index.eviction_heap.total_tokens()
-
-        # Perform eviction
-        result = _index.evict(request.num_tokens)
+        # Remove the evicted requests from our index
+        result = _index.remove_requests(request.request_ids)
+        
+        # Also clear conversation history for evicted requests
+        # This ensures ConversationTracker stays in sync with SGLang's cache
+        tracker = get_conversation_tracker()
+        conversations_cleared = 0
+        for req_id in request.request_ids:
+            cleared = tracker.clear_conversation(req_id)
+            conversations_cleared += cleared
 
         # Log eviction details
         logger.info(
-            f"Eviction: requested={request.num_tokens}, "
-            f"evicted={result['tokens_evicted']}, "
-            f"nodes_removed={len(result['evicted_node_ids'])}, "
-            f"tokens: {current_tokens:,} -> {result['tokens_remaining']:,}, "
-            f"max_allowed={_max_tokens:,}"
+            f"Eviction: removed {result['removed_count']} requests from index, "
+            f"cleared {conversations_cleared} conversation entries, "
+            f"not_found={len(result['not_found'])}"
         )
 
         return {
             "status": "success",
-            "max_tokens": _max_tokens,
-            "tokens_before": current_tokens,
+            "conversations_cleared": conversations_cleared,
             **result,
         }
 
     except Exception as e:
         logger.error(f"Error during eviction: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/reset")
+async def reset_index():
+    """
+    Reset the index to initial state.
+    
+    Clears all nodes, metadata, request tracking, and conversation history.
+    Use this to start fresh without restarting the server.
+    
+    After reset, you must call /build again before other operations.
+    """
+    global _index
+    
+    # Reset conversation tracker
+    reset_conversation_tracker()
+    
+    if _index is None:
+        return {
+            "status": "success",
+            "message": "No index to reset (was not initialized)",
+            "conversation_tracker": "reset",
+        }
+    
+    try:
+        _index.reset()
+        logger.info("Index and conversation tracker reset successfully")
+        
+        return {
+            "status": "success",
+            "message": "Index reset to initial state",
+            "conversation_tracker": "reset",
+        }
+    
+    except Exception as e:
+        logger.error(f"Error resetting index: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -400,34 +684,14 @@ async def search(request: SearchRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/update")
-async def update_node(request: UpdateNodeRequest):
-    """Update a node's token count."""
-    if _index is None:
-        raise HTTPException(
-            status_code=503, detail="Index not initialized. Call POST /build first."
-        )
-
-    try:
-        success = _index.update_node(
-            search_path=request.search_path, token_delta=request.token_delta
-        )
-
-        return {"status": "success" if success else "failed", "updated": success}
-
-    except Exception as e:
-        logger.error(f"Error during update: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
 @app.post("/insert")
 async def insert_context(request: InsertRequest):
     """
     Insert a new context into the index.
 
     Auto-generates a unique request_id for the new leaf node.
-    The response includes the request_id that can be used to track tokens
-    via POST /update_tokens.
+    The response includes the request_id that should be passed to SGLang
+    so that SGLang can track it in its radix cache for eviction notifications.
     """
     if _index is None:
         raise HTTPException(
@@ -445,155 +709,11 @@ async def insert_context(request: InsertRequest):
             "status": "success",
             "node_id": node_id,
             "search_path": search_path,
-            "request_id": request_id,  # Auto-generated for SGLang integration
+            "request_id": request_id,  # Pass this to SGLang for cache tracking
         }
 
     except Exception as e:
         logger.error(f"Error during insertion: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-# ============================================================================
-# Token Tracking Endpoint (SGLang Integration)
-# ============================================================================
-
-
-@app.post("/update_tokens")
-async def update_tokens(request: UpdateTokensRequest):
-    """
-    Update token count for a request.
-
-    THIS IS THE MAIN ENDPOINT FOR SGLANG INTEGRATION.
-
-    Call this endpoint when:
-    1. A request starts processing (with initial input tokens)
-    2. When generation completes (with total tokens: input + output)
-
-    The endpoint:
-    - Updates the token count for the given request_id
-    - Automatically triggers eviction if capacity is exceeded
-    - Returns eviction results if any nodes were evicted
-
-    Example SGLang integration:
-        # After request completes
-        response = requests.post(
-            "http://localhost:8765/update_tokens",
-            json={
-                "request_id": "req-000001",  # From build/insert response
-                "num_tokens": 1500           # Total tokens (input + output)
-            }
-        )
-    """
-    if _index is None:
-        raise HTTPException(
-            status_code=503, detail="Index not initialized. Call POST /build first."
-        )
-
-    try:
-        result = _index.update_tokens(
-            request_id=request.request_id, num_tokens=request.num_tokens
-        )
-
-        if not result["updated"]:
-            # Request not found - could be:
-            # 1. Invalid request_id (never existed)
-            # 2. Request was evicted during processing (race condition)
-            # Either way, return success - the request is "handled" (either never existed or already evicted)
-            logger.warning(
-                f"Request ID '{request.request_id}' not found (possibly evicted during processing). "
-                f"Returning success anyway."
-            )
-            return {
-                "status": "success",
-                "updated": False,
-                "message": "Request not found (possibly evicted)",
-                "request_id": request.request_id,
-                "num_tokens": request.num_tokens,
-            }
-
-        logger.info(
-            f"Updated tokens for request_id={request.request_id}: "
-            f"{result.get('previous_tokens', 0)} -> {result['num_tokens']}"
-        )
-
-        if result["eviction_triggered"]:
-            logger.info(
-                f"Eviction triggered: evicted {len(result['evicted_requests'])} requests, "
-                f"{result.get('tokens_evicted', 0)} tokens"
-            )
-
-        return {"status": "success", **result}
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error updating tokens: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.post("/touch")
-async def touch_request(request: TouchRequest):
-    """
-    Update access time for a request (LRU sync).
-
-    THIS ENDPOINT KEEPS LRU IN SYNC WITH SGLANG.
-
-    Call this when SGLang accesses (hits) a cached prefix.
-    This updates the access time so RAGBoost's eviction heap
-    stays in sync with SGLang's LRU ordering.
-
-    Example SGLang integration:
-        # When a request hits cached prefix
-        requests.post(
-            "http://localhost:8765/touch",
-            json={"request_id": "req-000001"}
-        )
-    """
-    if _index is None:
-        raise HTTPException(
-            status_code=503, detail="Index not initialized. Call POST /build first."
-        )
-
-    try:
-        success = _index.touch(request.request_id)
-
-        if not success:
-            raise HTTPException(
-                status_code=404, detail=f"Request ID '{request.request_id}' not found."
-            )
-
-        return {"status": "success", "request_id": request.request_id}
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error touching request: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.post("/touch_batch")
-async def touch_batch(request: TouchBatchRequest):
-    """
-    Update access time for multiple requests at once.
-
-    More efficient than calling /touch multiple times.
-    """
-    if _index is None:
-        raise HTTPException(
-            status_code=503, detail="Index not initialized. Call POST /build first."
-        )
-
-    try:
-        results = _index.touch_batch(request.request_ids)
-
-        return {
-            "status": "success",
-            "touched": results["touched"],
-            "not_found": results["not_found"]
-        }
-
-    except Exception as e:
-        logger.error(f"Error touching batch: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -633,68 +753,15 @@ async def get_stats():
 
     try:
         stats = _index.get_stats()
-        eviction_stats = _index.get_eviction_stats()
 
         return {
             "status": "success",
             "index_stats": stats,
-            "eviction_stats": eviction_stats,
             "timestamp": time.time(),
         }
 
     except Exception as e:
         logger.error(f"Error getting stats: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.get("/heap_status")
-async def get_heap_status():
-    """
-    Get detailed eviction heap status for debugging.
-    
-    Shows:
-    - Total tokens in heap
-    - Max tokens allowed
-    - Number of tracked requests
-    - LRU order (oldest first)
-    """
-    if _index is None:
-        raise HTTPException(
-            status_code=503, detail="Index not initialized. Call POST /build first."
-        )
-
-    try:
-        heap = _index.eviction_heap
-        
-        # Get all requests sorted by access time (oldest first = LRU)
-        requests_info = []
-        for request_id, node_id in _index._request_to_node.items():
-            metadata = _index.metadata.get(node_id)
-            if metadata:
-                requests_info.append({
-                    "request_id": request_id,
-                    "node_id": node_id,
-                    "tokens": metadata.total_tokens,
-                    "last_access_time": metadata.last_access_time,
-                })
-        
-        # Sort by access time (oldest first)
-        requests_info.sort(key=lambda x: x["last_access_time"])
-        
-        return {
-            "status": "success",
-            "total_tokens": heap.total_tokens(),
-            "max_tokens": _index._max_tokens,
-            "utilization_pct": (heap.total_tokens() / _index._max_tokens * 100) if _index._max_tokens else 0,
-            "num_requests": len(requests_info),
-            "heap_size": len(heap),
-            "total_touches": _index.live_stats.get('total_touches', 0),
-            "total_token_updates": _index.live_stats.get('total_token_updates', 0),
-            "lru_order": requests_info,  # Oldest first (will be evicted first)
-        }
-
-    except Exception as e:
-        logger.error(f"Error getting heap status: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -791,7 +858,10 @@ async def proxy_completions(request: Request):
     try:
         # Parse request body
         body = await request.json()
-        request_id = body.pop("request_id", None)  # Extract request_id if present
+        
+        # Check for request_id (from manual calls) or rid (from RAGPipeline)
+        # RAGPipeline sends 'rid' directly, manual calls may use 'request_id'
+        request_id = body.pop("request_id", None) or body.get("rid", None)
         
         # NOTE: We do NOT auto-generate request_id anymore.
         # The client should pass request_id from the /build response.
@@ -808,20 +878,19 @@ async def proxy_completions(request: Request):
             body["prompt"] = apply_chat_template(original_prompt, system_prompt)
             logger.debug("Applied chat template to prompt")
 
-        # Touch the request at the START to update LRU access time
-        # This keeps RAGBoost's eviction heap in sync with SGLang's cache access pattern
-        # Only touch if request_id exists in the index
+        # Verify request_id exists in the index
+        # Note: LRU tracking is now handled by SGLang's radix cache, not RAGBoost
         if request_id and _index:
-            if _index.touch(request_id):
-                logger.debug(f"Touched request_id={request_id}")
-            else:
-                logger.warning(f"Request ID '{request_id}' not found in index, token tracking disabled")
-                request_id = None  # Clear so SGLang won't try to update
+            node = _index.get_request_node(request_id)
+            if node is None:  # Use 'is None' because node_id=0 is valid but falsy
+                logger.warning(f"Request ID '{request_id}' not found in index")
+                request_id = None  # Clear so SGLang won't try to track
 
-        # Pass request_id to SGLang so it can use the same ID for token tracking
-        # Only set rid if we have a valid request_id in the index
+        # Pass request_id to SGLang so it can use the same ID for request tracking
+        # SGLang will notify RAGBoost via /evict callback when this request is evicted
+        # Only set rid if we have a valid request_id AND it's not already in the body
         if request_id:
-            body["rid"] = request_id
+            body["rid"] = request_id  # Ensure rid is set (may already be there from RAGPipeline)
             logger.info(f"Proxy: forwarding request with rid={request_id}")
         else:
             logger.info("Proxy: forwarding request without rid (no RAGBoost tracking)")
@@ -903,13 +972,23 @@ def main():
         description="RAGBoost Live Index HTTP Server with SGLang Proxy",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-Example:
-  python -m ragboost.server.http_server --port 8765 --max-tokens 1000000 --sglang-url http://localhost:30000
+Examples:
+  # Live mode (with SGLang eviction callback integration):
+  python -m ragboost.server.http_server --port 8765 --sglang-url http://localhost:30000
 
-The server acts as a proxy between your application and SGLang:
-  - Your app sends requests to localhost:8765
-  - The server forwards them to SGLang and tracks tokens
-  - Eviction is triggered automatically when max_tokens is exceeded
+  # Stateless mode (just clustering/scheduling, no index maintained):
+  python -m ragboost.server.http_server --port 8765 --stateless --sglang-url http://localhost:30000
+
+Live mode:
+  - Build context index via POST /build
+  - Receive eviction callbacks from SGLang at POST /evict
+  - SGLang notifies RAGBoost when requests are evicted from KV cache
+  - Start SGLang with: RAGBOOST_INDEX_URL=http://localhost:8765
+
+Stateless mode:
+  - Use POST /schedule endpoint for one-off batch reordering
+  - No index maintained, no eviction tracking
+  - Each /schedule call is independent
         """,
     )
     parser.add_argument("--host", default="0.0.0.0", help="Host to bind to")
@@ -917,8 +996,14 @@ The server acts as a proxy between your application and SGLang:
     parser.add_argument(
         "--max-tokens",
         type=int,
-        required=True,
-        help="Maximum tokens allowed in index (REQUIRED for eviction)",
+        default=None,
+        help="(Deprecated) No longer required - eviction is now driven by SGLang callback",
+    )
+    parser.add_argument(
+        "--stateless",
+        action="store_true",
+        help="Run in stateless mode: clustering/scheduling only, no index maintained. "
+             "Use POST /schedule endpoint for batch reordering.",
     )
     parser.add_argument(
         "--sglang-url",
@@ -941,16 +1026,22 @@ The server acts as a proxy between your application and SGLang:
 
     args = parser.parse_args()
 
+    # Note: --max-tokens is no longer required since eviction is now driven by
+    # SGLang's callback, not by RAGBoost's internal tracking
+
     # Set environment variables so they propagate to uvicorn workers
-    os.environ["RAGBOOST_MAX_TOKENS"] = str(args.max_tokens)
+    if args.max_tokens is not None:
+        os.environ["RAGBOOST_MAX_TOKENS"] = str(args.max_tokens)
     os.environ["RAGBOOST_SGLANG_URL"] = args.sglang_url.rstrip("/")
+    os.environ["RAGBOOST_STATELESS_MODE"] = "1" if args.stateless else "0"
     if args.model:
         os.environ["RAGBOOST_MODEL_NAME"] = args.model
 
     # Also set global config for direct access
-    global _max_tokens, _sglang_url, _tokenizer, _model_name
+    global _max_tokens, _sglang_url, _tokenizer, _model_name, _stateless_mode
     _max_tokens = args.max_tokens
     _sglang_url = args.sglang_url.rstrip("/")
+    _stateless_mode = args.stateless
 
     # Initialize tokenizer for chat template
     if args.model and AutoTokenizer is not None:
@@ -967,8 +1058,13 @@ The server acts as a proxy between your application and SGLang:
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     )
 
-    logger.info(f"Starting RAGBoost Index Server on {args.host}:{args.port}")
-    logger.info(f"Maximum tokens configured: {_max_tokens:,}")
+    if _stateless_mode:
+        logger.info(f"Starting RAGBoost Index Server on {args.host}:{args.port} (STATELESS MODE)")
+        logger.info("Stateless mode: clustering/scheduling only, no cache tracking")
+        logger.info("Use POST /schedule endpoint for batch reordering")
+    else:
+        logger.info(f"Starting RAGBoost Index Server on {args.host}:{args.port} (LIVE MODE)")
+        logger.info("Eviction is driven by SGLang callback (RAGBOOST_INDEX_URL)")
     logger.info(f"SGLang backend URL: {_sglang_url}")
 
     # Run server
@@ -979,8 +1075,6 @@ The server acts as a proxy between your application and SGLang:
         workers=args.workers,
         log_level=args.log_level,
     )
-    #     try: requests.post("http://localhost:8765/evict", json={"num_tokens": num_tokens}, timeout=1.0)
-    #     except: pass
 
 
 if __name__ == "__main__":
