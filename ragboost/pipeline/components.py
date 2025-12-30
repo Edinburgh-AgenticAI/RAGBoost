@@ -108,6 +108,8 @@ class InferenceConfig:
         max_tokens: Maximum tokens to generate
         batch_size: Batch size for inference
         prompt_template: Custom prompt template
+        apply_chat_template: Whether to apply chat template to prompts
+        system_prompt: System prompt to use with chat template
         extra_params: Additional inference parameters
     """
     model_name: str
@@ -118,6 +120,8 @@ class InferenceConfig:
     max_tokens: int = 512
     batch_size: int = 1
     prompt_template: Optional[str] = None
+    apply_chat_template: bool = True
+    system_prompt: Optional[str] = None
     extra_params: Dict[str, Any] = field(default_factory=dict)
     
     def __post_init__(self):

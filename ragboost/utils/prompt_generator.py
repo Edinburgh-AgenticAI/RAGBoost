@@ -1,3 +1,80 @@
+from typing import List, Dict, Any, Optional, Tuple
+
+try:
+    from transformers import AutoTokenizer
+    HAS_TRANSFORMERS = True
+except ImportError:
+    AutoTokenizer = None
+    HAS_TRANSFORMERS = False
+
+# Global tokenizer instance (cached)
+_tokenizer = None
+_tokenizer_model_name = None
+
+
+def get_tokenizer(model_name: str):
+    """Get or create a tokenizer instance for the given model."""
+    global _tokenizer, _tokenizer_model_name
+    
+    if not HAS_TRANSFORMERS:
+        return None
+    
+    if _tokenizer is not None and _tokenizer_model_name == model_name:
+        return _tokenizer
+    
+    try:
+        _tokenizer = AutoTokenizer.from_pretrained(model_name)
+        _tokenizer_model_name = model_name
+        return _tokenizer
+    except Exception as e:
+        print(f"Warning: Failed to load tokenizer for {model_name}: {e}")
+        return None
+
+
+def apply_chat_template(
+    prompt: str,
+    tokenizer=None,
+    model_name: Optional[str] = None,
+    system_prompt: Optional[str] = None,
+    add_generation_prompt: bool = True
+) -> str:
+    """
+    Apply chat template to a prompt.
+    
+    Args:
+        prompt: The user's message/prompt text
+        tokenizer: Pre-loaded tokenizer instance (optional)
+        model_name: Model name to load tokenizer from (if tokenizer not provided)
+        system_prompt: Optional system prompt to prepend
+        add_generation_prompt: Whether to add generation prompt (default True)
+    
+    Returns:
+        The formatted prompt string with chat template applied,
+        or the original prompt if no tokenizer is available.
+    """
+    # Get tokenizer
+    if tokenizer is None and model_name:
+        tokenizer = get_tokenizer(model_name)
+    
+    if tokenizer is None:
+        return prompt
+    
+    # Build messages list
+    messages = []
+    if system_prompt:
+        messages.append({"role": "system", "content": system_prompt})
+    messages.append({"role": "user", "content": prompt})
+    
+    try:
+        formatted = tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=add_generation_prompt
+        )
+        return formatted
+    except Exception as e:
+        print(f"Warning: Failed to apply chat template: {e}. Using raw prompt.")
+        return prompt
+
+
 PROMPT_TEMPLATE = '''
 **Note**:
 1. Please answer within 10 words or fewer. If the answer is Yes or No, just say Yes or No
@@ -37,8 +114,28 @@ Answer the question:
 </question_section>
 '''
 
-def prompt_generator(chunk_id_text_dict, reordered_inputs):
-
+def prompt_generator(
+    chunk_id_text_dict: Dict[Any, str],
+    reordered_inputs: List[Dict[str, Any]],
+    tokenizer=None,
+    model_name: Optional[str] = None,
+    system_prompt: Optional[str] = None,
+    apply_template: bool = False
+) -> Tuple[List[str], List[Any], List[Any]]:
+    """
+    Generate prompts from reordered inputs with document context.
+    
+    Args:
+        chunk_id_text_dict: Mapping from document ID to document text
+        reordered_inputs: List of reordered input dictionaries
+        tokenizer: Pre-loaded tokenizer instance for chat template (optional)
+        model_name: Model name to load tokenizer from (optional)
+        system_prompt: Optional system prompt for chat template
+        apply_template: Whether to apply chat template (default False)
+    
+    Returns:
+        Tuple of (prompts, qids, answers)
+    """
     def format_docs(reordered_doc_ids):
         """Format documents section using doc IDs"""
         docs_section = ""
@@ -76,13 +173,42 @@ def prompt_generator(chunk_id_text_dict, reordered_inputs):
             question=question,
             importance_ranking=importance_ranking
         )
+        
+        # Apply chat template if requested
+        if apply_template:
+            prompt = apply_chat_template(
+                prompt,
+                tokenizer=tokenizer,
+                model_name=model_name,
+                system_prompt=system_prompt
+            )
 
         prompts.append(prompt)
         
     return prompts, qids, answers
 
-def prompt_generator_baseline(chunk_id_text_dict, inputs):
-
+def prompt_generator_baseline(
+    chunk_id_text_dict: Dict[Any, str],
+    inputs: List[Dict[str, Any]],
+    tokenizer=None,
+    model_name: Optional[str] = None,
+    system_prompt: Optional[str] = None,
+    apply_template: bool = False
+) -> Tuple[List[str], List[Any], List[Any]]:
+    """
+    Generate baseline prompts from inputs with document context (no reordering).
+    
+    Args:
+        chunk_id_text_dict: Mapping from document ID to document text
+        inputs: List of input dictionaries
+        tokenizer: Pre-loaded tokenizer instance for chat template (optional)
+        model_name: Model name to load tokenizer from (optional)
+        system_prompt: Optional system prompt for chat template
+        apply_template: Whether to apply chat template (default False)
+    
+    Returns:
+        Tuple of (prompts, qids, answers)
+    """
     def format_docs(doc_ids):
         """Format documents section using doc IDs"""
         docs_section = ""
@@ -110,6 +236,15 @@ def prompt_generator_baseline(chunk_id_text_dict, inputs):
             docs_section=docs_section,
             question=question
         )
+        
+        # Apply chat template if requested
+        if apply_template:
+            prompt = apply_chat_template(
+                prompt,
+                tokenizer=tokenizer,
+                model_name=model_name,
+                system_prompt=system_prompt
+            )
 
         prompts.append(prompt)
         

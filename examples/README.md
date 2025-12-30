@@ -1,170 +1,86 @@
 # RAGBoost Examples
 
-This directory contains practical code examples for using RAGBoost.
+Practical code examples for using RAGBoost. See [docs/USAGE.md](../docs/USAGE.md) for comprehensive documentation.
+
+## Quick Reference
+
+| Example | Description | Prerequisites |
+|---------|-------------|---------------|
+| `pipeline_examples.py` | Basic Pipeline API usage | Corpus file |
+| `multi_turn_example.py` | Multi-turn conversation with deduplication | Corpus file |
+| `http_server_example.py` | Index server integration | RAGBoost server running |
+| `stateless_batch_example.py` | Stateless batch scheduling | RAGBoost server (stateless mode) |
+
+## Running Examples
+
+### 1. Basic Pipeline (Offline Mode)
+
+```bash
+# Start inference server
+python -m sglang.launch_server --model-path Qwen/Qwen2.5-7B-Instruct --port 30000
+
+# Run pipeline example
+python examples/pipeline_examples.py
+```
+
+### 2. Multi-Turn Conversations
+
+```bash
+python examples/multi_turn_example.py
+```
+
+### 3. Index Server (Stateless Mode)
+
+```bash
+# Terminal 1: Start server
+python -m ragboost.server.http_server --port 8765 --stateless
+
+# Terminal 2: Run example
+python examples/stateless_batch_example.py
+```
+
+### 4. Index Server (Stateful Mode)
+
+```bash
+# Terminal 1: Start SGLang
+python -m sglang.launch_server --model-path Qwen/Qwen2.5-7B-Instruct --port 30000
+
+# Terminal 2: Start RAGBoost server
+python -m ragboost.server.http_server --port 8765 --max-tokens 1000000 --infer-api-url http://localhost:30000
+
+# Terminal 3: Run example
+python examples/http_server_example.py
+```
 
 ## Directory Structure
 
 ```
 examples/
-├── README.md                                      # This file
-├── pipeline_examples.py                           # Basic Pipeline API examples
-├── concurrent_first_then_multiturn_example.py     # Multi-turn with deduplication
-├── batch_inference/                               # Low-level batch processing
-│   ├── prepare_batch.py                          # Batch optimization
-│   ├── sglang_inference.py                       # Inference with SGLang
-│   └── analyze_results.py                        # Performance analysis
-└── construct_rag_data/                           # Data retrieval
-    ├── multihopRAG_faiss.py                      # FAISS vector search
-    └── multihopRAG_bm25.py                       # BM25 lexical search
-```
-
-## Available Examples
-
-### pipeline_examples.py
-
-Basic Pipeline API examples:
-
-1. Simple RAGBoost - Minimal example
-2. With vs Without RAGBoost - Comparison
-3. FAISS + RAGBoost - Vector search
-4. Advanced Configuration
-5. Custom Retriever
-6. Existing Retrieval Results
-
-**Run:**
-```bash
-python examples/pipeline_examples.py
-```
-
-### concurrent_first_then_multiturn_example.py
-
-**Production multi-turn workflow with concurrent users:**
-
-- **Phase 1**: Multiple users start conversations → Context optimization
-- **Phase 2**: Users continue with follow-ups concurrently → Per-conversation deduplication
-- Includes LLM response generation
-
-**Run:**
-```bash
-# Start inference server first
-python -m sglang.launch_server --model-path Qwen/Qwen3-4B-Instruct-2507 --port 30000
-
-# Run example
-python examples/concurrent_first_then_multiturn_example.py
-```
-
-### batch_inference/
-
-Low-level batch processing examples for production workflows:
-
-- **prepare_batch.py** - Optimize retrieval results into batches
-- **sglang_inference.py** - Run inference with SGLang server
-- **analyze_results.py** - Analyze cache efficiency and performance
-
-**Run:**
-```bash
-# Step 1: Optimize batch
-python -m examples.batch_inference.prepare_batch \
- --context_path retrieval_results.jsonl \
- --output_path optimized_batch.jsonl
-
-# Step 2: Run inference (after starting SGLang server)
-python -m examples.batch_inference.sglang_inference \
- --model Qwen/Qwen2.5-32B-Instruct \
- --batch_path optimized_batch.jsonl \
- --corpus_path corpus.jsonl
-
-# Step 3: Analyze results
-python -m examples.batch_inference.analyze_results \
- --result_path results.jsonl \
- --output_dir analysis/
-```
-
-### construct_rag_data/
-
-Data retrieval examples:
-
-- **multihopRAG_bm25.py** - BM25 lexical search with Elasticsearch
-- **multihopRAG_faiss.py** - FAISS vector search with embeddings
-
-**Run:**
-```bash
-# BM25 retrieval
-python -m examples.construct_rag_data.multihopRAG_bm25 \
- --query_path queries.jsonl \
- --corpus_path corpus.jsonl \
- --output_path retrieval_results.jsonl
-
-# FAISS retrieval (requires embedding server running)
-python -m examples.construct_rag_data.multihopRAG_faiss \
- --corpus_path corpus.jsonl \
- --query_path queries.jsonl \
- --output_path retrieval_results.jsonl
+├── pipeline_examples.py          # Basic Pipeline API
+├── multi_turn_example.py         # Multi-turn with deduplication
+├── http_server_example.py        # Stateful index server
+├── stateless_batch_example.py    # Stateless batch scheduling
+├── batch_inference/              # Low-level batch processing
+│   ├── prepare_batch.py          # Batch optimization
+│   ├── sglang_inference.py       # SGLang inference
+│   └── analyze_results.py        # Performance analysis
+└── construct_rag_data/           # Data retrieval utilities
+    ├── multihopRAG_bm25.py       # BM25 retrieval
+    └── multihopRAG_faiss.py      # FAISS retrieval
 ```
 
 ## Data Formats
 
-All examples expect JSONL format:
-
-**Queries:**
+**Queries (JSONL):**
 ```json
-{"qid": 0, "question": "What is machine learning?", "answers": ["ML is..."]}
+{"qid": 0, "text": "What is machine learning?"}
 ```
 
-**Corpus:**
+**Corpus (JSONL):**
 ```json
-{"chunk_id": 0, "text": "Machine learning is a subset of AI...", "title": "ML"}
+{"doc_id": 0, "text": "Machine learning is a subset of AI..."}
 ```
 
-**Retrieval Results:**
-```json
-{"text": "What is machine learning?", "top_k_doc_id": ["42", "15", "8"]}
-```
+## More Information
 
-## Running Examples
-
-From project root:
-```bash
-# Run pipeline examples
-python examples/pipeline_examples.py
-
-# Run batch processing (module syntax)
-python -m examples.batch_inference.prepare_batch --help
-
-# Run retrieval
-python -m examples.construct_rag_data.multihopRAG_bm25 --help
-```
-
-## Requirements
-
-Install RAGBoost first:
-```bash
-pip install -e .
-```
-
-**Optional (depending on example):**
-- Elasticsearch (for BM25)
-- FAISS: `pip install faiss-cpu` or `faiss-gpu`
-- SGLang or vLLM (for inference)
-
-## Troubleshooting
-
-**Import Error:**
-```bash
-# Install RAGBoost first
-cd /path/to/RAGBoost
-pip install -e .
-```
-
-**Elasticsearch Connection Failed:**
-```bash
-# Start Elasticsearch with Docker
-docker run -d -p 9200:9200 -e "discovery.type=single-node" elasticsearch:8.x
-```
-
-**FAISS Index Not Found:**
-Build the index first or provide `corpus_data` to auto-create it.
-
----
-
-For detailed guides, see [Documentation](../docs/README.md).
+See [docs/USAGE.md](../docs/USAGE.md) for complete documentation.
