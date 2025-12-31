@@ -24,13 +24,12 @@ RAGBoost is a fast optimization system for Retrieval-Augmented Generation worklo
 
 1. **High Throughput**: Boosting prefill throughput with intelligent context reuse.
 2. **Accuracy Preserved**: Reasoning accuracy is fully preserved and even enhanced!
-3. **Multi-Turn Deduplication**: Automatic context deduplication across conversation turns, reducing 30-60% redundant document processing.
-4. **Strong Compatibility**: Strong compatibility with existing RAG libraries (HippoRAG), KV cache optimization engine (LMCache), and Inference engines (vLLM and SGLang). Both single-node and multi-node deployment!
-5. **Widely Tested**: Tested with a wide range of RAG and Agentic AI applications.
+3. **Strong Compatibility**: Strong compatibility with existing RAG libraries (HippoRAG), KV cache optimization engine (LMCache), and Inference engines (vLLM and SGLang). Both single-node and multi-node deployment!
+4. **Widely Tested**: Tested with a wide range of RAG and Agentic AI applications.
 
 ## Benchmark and Performance
 
-### Multi-session & Multi-turn Performance
+### System Performance
 
 ![Benchmark Results](assets/benchmark.png)
 
